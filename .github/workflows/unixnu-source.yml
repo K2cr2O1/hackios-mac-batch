@@ -22,6 +22,10 @@ on:
         description: Build a signed standalone A640 owned-BO probe (Metal profile only; not installed)
         type: boolean
         default: false
+      ui_watch:
+        description: Build opt-in bounded UI exec and first main-thread observation (no device installation)
+        type: boolean
+        default: false
       turnip_only:
         description: Build only Turnip (Mesa Vulkan, darwin KMD) for iOS against the A640 ABI; skips the kernel job
         type: boolean
@@ -57,6 +61,7 @@ jobs:
           REQUESTED_CONFIG: ${{ inputs.defconfig }}
           CAPTURE_LOGS: ${{ inputs.capture_logs }}
           GPU_USERPROBE: ${{ inputs.gpu_userprobe }}
+          UI_WATCH: ${{ inputs.ui_watch }}
         run: |
           test "$REQUESTED_REF" = 245aca1a9ec5b730b1cad80fade295800d2981f1
           if [ "$GPU_USERPROBE" = true ]; then test "$REQUESTED_CONFIG" = nabu_ufs_gpu_metal_defconfig; fi
@@ -67,6 +72,11 @@ jobs:
           log_args=()
           if [ "$CAPTURE_LOGS" = true ]; then log_args+=(--capture-logs); fi
           if [ "$GPU_USERPROBE" = true ]; then log_args+=(--gpu-userprobe); fi
+          if [ "$UI_WATCH" = true ]; then
+            test "$GPU_USERPROBE" = true && test "$CAPTURE_LOGS" = true
+            test "$REQUESTED_CONFIG" = nabu_ufs_gpu_metal_defconfig
+            log_args+=(--ui-watch)
+          fi
           python3 source-ci/prepare_source.py --upstream unixnu --device nabu-device --profile "$REQUESTED_CONFIG" --report "$RUNNER_TEMP/source-prepare.json" "${log_args[@]}"
       - name: Fetch the pinned private small input
         env:

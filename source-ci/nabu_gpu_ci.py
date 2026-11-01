@@ -328,6 +328,8 @@ def qualify_userprobe_boot(read, candidate):
     definitions, _ = candidate_definitions(candidate, METAL_PROFILE, extra_required)
     require(b'NabuGPU: userprobe addon' in candidate and b'nabu-gpu-userprobe-addon' in candidate,
             'Final kernel lacks GPU userprobe boot code')
+    from nabu_ui_watch_qualification import qualify as qualify_ui_watch
+    ui_watch = qualify_ui_watch(read, candidate)
     return {'mode': 'closed_inline_abi1_probe', 'trigger': 'nabu-gpu-userprobe=1',
             **({'parent_root_creation': True} if parents_fixed else {}),
             **({'owner_job_cache': True, 'addon_files': 4} if cache_entries == 4 else {}),
@@ -341,6 +343,7 @@ def qualify_userprobe_boot(read, candidate):
             **({'exec_stage_observer': True, 'exec_stage_records_maximum': 32} if exec_trace_constants else {}),
             **({'process_observer': True, 'exit_source_sha256': sha(exit_source),
                 'process_symbols': {name: definitions[name] for name in sorted(extra_required)}} if process_bound else {}),
+            'ui_watch': ui_watch,
             'header_sha256': sha(header), 'generator_sha256': sha(generator),
             'ram_source_sha256': sha(ram), 'ram_object_sha256': sha(obj),
             'ram_archive_sha256': sha(archive), 'data_source_sha256': sha(data),

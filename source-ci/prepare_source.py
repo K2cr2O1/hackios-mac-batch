@@ -623,7 +623,10 @@ def main():
     p.add_argument('--profile', choices=PROFILES, default=PROFILES[0])
     p.add_argument('--capture-logs', action='store_true', help='Build the explicit RAM/ESP logging capability; writes remain opt-in')
     p.add_argument('--gpu-userprobe', action='store_true', help='Enable the closed ABI1 probe addon boot transport')
+    p.add_argument('--ui-watch', action='store_true', help='Compile opt-in bounded UI exec/main-thread observations')
     args = p.parse_args()
+    if args.ui_watch and (args.profile != UFS_GPU_METAL_PROFILE or not args.capture_logs or not args.gpu_userprobe):
+        raise SystemExit('UI watch requires the explicit captured Metal profile and GPU userprobe')
     if args.capture_logs and args.profile not in UFS_OWNER_PROFILES:
         raise SystemExit('Log persistence is only qualified for explicit hardware UFS owner profiles')
     if args.gpu_userprobe and (args.profile != UFS_GPU_METAL_PROFILE or not args.capture_logs):
@@ -656,7 +659,8 @@ def main():
         anchor = '    build_archives(ctx, env)\n'
         if text.count(anchor) != 1:
             raise ValueError('Expected one archive entry for GPU userprobe support')
-        kernel.write_text(text.replace(anchor, "    env['NABU_GPU_USERPROBE'] = '1'\n" + anchor, 1),
+        ui_env = "    env['NABU_UI_WATCH'] = '1'\n" if args.ui_watch else ''
+        kernel.write_text(text.replace(anchor, "    env['NABU_GPU_USERPROBE'] = '1'\n" + ui_env + anchor, 1),
                           encoding='utf-8')
     board = validate_profile(args.device)
     head = subprocess.check_output(['git', '-C', str(args.upstream), 'rev-parse', 'HEAD'], text=True).strip()
@@ -722,7 +726,7 @@ def main():
         'ufs_cpu_present': args.profile == UFS_CPU_PRESENT_PROFILE,
         'ufs_gpu': args.profile in (UFS_GPU_PROFILE, UFS_GPU_METAL_PROFILE),
         'ufs_gpu_metal': args.profile == UFS_GPU_METAL_PROFILE,
-        'gpu_userprobe_boot': args.gpu_userprobe,
+        'gpu_userprobe_boot': args.gpu_userprobe, 'ui_watch': args.ui_watch,
         'gpu': ({'mode': 'a640_metal', 'firmware_mode': 'adt', 'trigger': 'nabu-gpu=1',
                  'metal_accelerator': True, 'runtime_qualified': False}
                 if args.profile == UFS_GPU_METAL_PROFILE else

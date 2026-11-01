@@ -194,6 +194,7 @@ def selected_sources(device):
         (device / 'scripts/nabu_adreno_bindings.py', 'device/scripts/nabu_adreno_bindings.py'),
         (device / 'scripts/build-nabu-gpu-userprobe.py', 'device/scripts/build-nabu-gpu-userprobe.py'),
         (device / 'scripts/nabu_gpu_userprobe_source.py', 'device/scripts/nabu_gpu_userprobe_source.py'),
+        (device / 'scripts/nabu_ui_watch_source.py', 'device/scripts/nabu_ui_watch_source.py'),
         (device / 'platform/NabuGpuUserprobeAddon.h', 'device/platform/NabuGpuUserprobeAddon.h'),
         (device / 'userprobe/nabu_gpu_userprobe.cpp', 'device/userprobe/nabu_gpu_userprobe.cpp'),
         (device / 'LICENSE', 'device/LICENSE'),
@@ -228,6 +229,7 @@ def selected_sources(device):
         (source_dir / 'nabu_cs_stream.py', 'source-ci/nabu_cs_stream.py'),
         (source_dir / 'nabu_display_ci.py', 'source-ci/nabu_display_ci.py'),
         (source_dir / 'nabu_gpu_ci.py', 'source-ci/nabu_gpu_ci.py'),
+        (source_dir / 'nabu_ui_watch_qualification.py', 'source-ci/nabu_ui_watch_qualification.py'),
         (source_dir / 'nabu_graphics_startup.py', 'source-ci/nabu_graphics_startup.py'),
         (device / 'scripts/build-nabu-legacy-display.py', 'device/scripts/build-nabu-legacy-display.py'),
         (device / 'scripts/nabu_display_bindings.py', 'device/scripts/nabu_display_bindings.py'),
@@ -350,6 +352,7 @@ def main():
                 'ufs_gpu': prepared.get('ufs_gpu', False),
                 'ufs_gpu_metal': prepared.get('ufs_gpu_metal', False),
                 'gpu_userprobe_boot': prepared.get('gpu_userprobe_boot', False),
+                'ui_watch': prepared.get('ui_watch', False),
                 'gpu': ({**gpu_contract(prepared.get('profile'))} if prepared.get('ufs_gpu') is True else None),
                 'display_reference': prepared.get('display_reference'),
                 'log_capture': prepared.get('log_capture'),
@@ -430,6 +433,10 @@ def main():
                     args.upstream, args.device, candidate, expected_profile=identity['profile'])
                 if prepared.get('gpu_userprobe_boot') is True and not manifest['gpu_qualification'].get('userprobe_boot'):
                     raise ValueError('Requested GPU userprobe boot support was not qualified')
+                ui = manifest['gpu_qualification'].get('userprobe_boot', {}).get('ui_watch', {})
+                if bool(ui.get('compiled')) != identity['ui_watch']:
+                    raise ValueError('Requested UI observer build differs from its actual qualification')
+                summary['ui_watch_qualified_statically'] = bool(ui.get('compiled'))
                 summary['gpu_qualified_statically'] = True
             elif identity['ufs_gpu'] or prepared.get('gpu'):
                 raise ValueError('GPU contract is only valid for the explicit GPU profiles')

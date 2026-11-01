@@ -18,6 +18,17 @@ def gpu_userprobe_data_source(text, restore=False, exit_observer=False):
     return module.exit_source(text, restore=restore) if exit_observer else module.data_source(text, restore=restore)
 
 
+def ui_watch_source(text, restore=False, exit_observer=False):
+    # Only enabled builds or explicit restoration load this optional module.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('nabu_ui_watch_source',
+        Path(__file__).with_name('nabu_ui_watch_source.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    transform = module.exit_source if exit_observer else module.exec_source
+    return transform(text, restore=restore)
+
+
 def replace_once(text, old, new):
     if text.count(old) != 1:
         raise ValueError('Logging source drift: ' + old[:100])
@@ -347,6 +358,9 @@ def patch_exit_panic_state(text):
 
 
 def apply(root, device):
+    ui_watch = os.environ.get('NABU_UI_WATCH') == '1'
+    if ui_watch and os.environ.get('NABU_GPU_USERPROBE') != '1':
+        raise ValueError('UI watch needs the compiled GPU userprobe callback')
     xnu = root / '.cache/xnu-work'
     changed = {}
     for relative, transforms in [
@@ -362,12 +376,16 @@ def apply(root, device):
             ('osfmk/kern/exception.c', [patch_user_exception])]:
         path = xnu / relative
         result = path.read_text(encoding='utf-8')
+        if relative in ('bsd/kern/kern_exec.c', 'bsd/kern/kern_exit.c') and 'NABU_UI_WATCH' in result:
+            result = ui_watch_source(result, restore=True, exit_observer=relative.endswith('kern_exit.c'))
         for transform in transforms:
             result = transform(result)
         if relative == 'bsd/kern/kern_exec.c' and os.environ.get('NABU_GPU_USERPROBE') == '1':
             result = gpu_userprobe_data_source(result)
         if relative == 'bsd/kern/kern_exit.c' and os.environ.get('NABU_GPU_USERPROBE') == '1':
             result = gpu_userprobe_data_source(result, exit_observer=True)
+        if ui_watch and relative in ('bsd/kern/kern_exec.c', 'bsd/kern/kern_exit.c'):
+            result = ui_watch_source(result, exit_observer=relative.endswith('kern_exit.c'))
         path.write_text(result, encoding='utf-8')
         changed[relative] = hashlib.sha256(result.encode()).hexdigest()
     for name in ('NabuLogCore.h', 'NabuLogFormat.h'):
@@ -392,6 +410,9 @@ def apply(root, device):
         'exit_panic_state': 'existing SpringBoard error-exit panic only; no new panic trigger',
         'data_mount_trace': 'NABU_CAPTURE_V2_3' in (xnu / 'bsd/kern/kern_exec.c').read_text(),
         'gpu_userprobe_boot': os.environ.get('NABU_GPU_USERPROBE') == '1',
+        'ui_watch': ui_watch,
+        'ui_watch_generator_sha256': (hashlib.sha256(Path(__file__).with_name(
+            'nabu_ui_watch_source.py').read_bytes()).hexdigest() if ui_watch else None),
         'data_trace_stages': {'1': 'seed ready', '2': 'mount enter',
                               '3': 'mount returned', '4': 'lookup returned',
                               '5': 'validation/skeleton returned', '6': 'prepare returned'},
@@ -408,7 +429,8 @@ if __name__ == '__main__':
         path = a.root / '.cache/xnu-work/bsd/kern/kern_exec.c'
         if path.exists():
             before = path.read_text(encoding='utf-8')
-            after = patch_data_mount(before, restore=True)
+            after = ui_watch_source(before, restore=True) if 'NABU_UI_WATCH' in before else before
+            after = patch_data_mount(after, restore=True)
             if 'NABU_GPU_USERPROBE_JOB_V1' in after:
                 after = gpu_userprobe_data_source(after, restore=True)
             if before != after:
@@ -416,6 +438,8 @@ if __name__ == '__main__':
         exit_path = a.root / '.cache/xnu-work/bsd/kern/kern_exit.c'
         if exit_path.exists():
             before = exit_path.read_text(encoding='utf-8')
+            if 'NABU_UI_WATCH' in before:
+                before = ui_watch_source(before, restore=True, exit_observer=True)
             if 'NABU_GPU_USERPROBE_EXIT_V1' in before:
                 after = gpu_userprobe_data_source(before, restore=True, exit_observer=True)
                 exit_path.write_text(after, encoding='utf-8')
