@@ -1,7 +1,7 @@
 """Reversible, explicitly enabled UI exec and first-main-thread observations."""
 
 CONTRACT = {
-    'version': 2, 'trigger': 'nabu-ui-watch=1',
+    'version': 3, 'trigger': 'nabu-ui-watch=1',
     'targets': ['SpringBoard', 'backboardd', 'runningboardd'],
     'paths': ['/System/Library/CoreServices/SpringBoard.app/SpringBoard',
               '/usr/libexec/backboardd', '/usr/libexec/runningboardd'],
@@ -20,6 +20,7 @@ CONTRACT = {
     'max_samples': 64, 'interval_us': 10000000, 'max_threads': 3,
     'max_events': 96, 'max_exec_contexts': 0, 'max_line_bytes': 256, 'first_incarnation_only': True,
     'target_association': 'activation-call-output',
+    'spawn_branch_observation': True,
     'user_memory_read': False, 'scheduler_changed': False, 'new_worker': False,
     'runtime_qualified': False,
 }
@@ -147,22 +148,18 @@ nabu_ui_watch_activation(proc_t p, int target, unsigned returned, int result)
 }
 
 void
-nabu_ui_watch_signature(proc_t p, int target, int result)
+nabu_ui_watch_signature(proc_t p, int target, int result, int spawn)
 {
     if (!nabu_ui_enabled() || !p) return;
     if (target >= 0 && target < NABU_UI_TARGETS)
-        nabu_ui_event_note((unsigned)target, p, NULL, "signature_return", result);
+        nabu_ui_event_note((unsigned)target, p, NULL,
+            spawn ? "spawn_signature_return" : "signature_return", result);
 }
 
-void
-nabu_ui_watch_release_ready(proc_t p, thread_t thread, int target, int error, int committed, int no_exec)
+static void
+nabu_ui_publish_thread(proc_t p, thread_t thread, int target, unsigned release_seq)
 {
-    if (!nabu_ui_enabled() || !p || no_exec ||
-        __atomic_load_n(&nabu_ui_closed, __ATOMIC_ACQUIRE)) return;
-    if (target < 0 || target >= NABU_UI_TARGETS) return;
-    unsigned release_seq = nabu_ui_event_note((unsigned)target, p, thread,
-        !committed ? "not_committed" : error ? "final_error" : "release_ready", error);
-    if (error || !committed || !thread) return;
+    if (!thread) return;
     if (nabu_ui_target(p->p_comm, 0) != target) {
         nabu_ui_event_note((unsigned)target, p, thread, "identity_mismatch", 0);
         return;
@@ -196,11 +193,30 @@ nabu_ui_watch_release_ready(proc_t p, thread_t thread, int target, int error, in
 }
 
 void
+nabu_ui_watch_release_ready(proc_t p, thread_t thread, int target, int error, int committed, int no_exec)
+{
+    if (!nabu_ui_enabled() || !p ||
+        __atomic_load_n(&nabu_ui_closed, __ATOMIC_ACQUIRE)) return;
+    if (target < 0 || target >= NABU_UI_TARGETS) return;
+    if (no_exec) {
+        unsigned release_seq = nabu_ui_event_note((unsigned)target, p, thread,
+            error ? "spawn_release_failed" : "spawn_release_ready", error);
+        if (!error && committed) nabu_ui_publish_thread(p, thread, target, release_seq);
+        return;
+    }
+    unsigned release_seq = nabu_ui_event_note((unsigned)target, p, thread,
+        !committed ? "not_committed" : error ? "final_error" : "release_ready", error);
+    if (error || !committed) return;
+    nabu_ui_publish_thread(p, thread, target, release_seq);
+}
+
+void
 nabu_ui_watch_released(proc_t p, thread_t thread, int target, int error, int committed, int no_exec)
 {
-    if (!nabu_ui_enabled() || !p || no_exec) return;
+    if (!nabu_ui_enabled() || !p) return;
     if (target >= 0 && target < NABU_UI_TARGETS) nabu_ui_event_note((unsigned)target, p, thread,
-        committed && !error ? "exec_released" : "release_failed", error);
+        no_exec ? (committed && !error ? "spawn_released" : "spawn_release_failed") :
+        (committed && !error ? "exec_released" : "release_failed"), error);
 }
 
 void
@@ -567,7 +583,7 @@ EXEC_PAIRS = (
 #if defined(HAS_APPLE_PAC)
 ''',
      r'''		error = process_signature(p, imgp);
-		nabu_ui_watch_signature(p, nabu_ui_exec_target, error);
+		nabu_ui_watch_signature(p, nabu_ui_exec_target, error, 0);
 	}
 
 #if defined(HAS_APPLE_PAC)
@@ -578,7 +594,7 @@ EXEC_PAIRS = (
 		 * Pay for our earlier safety; deliver the delayed signals from
 ''',
      r'''		error = process_signature(p, imgp);
-		if (!spawn_no_exec) nabu_ui_watch_signature(p, nabu_ui_exec_target, error);
+		nabu_ui_watch_signature(p, nabu_ui_exec_target, error, spawn_no_exec);
 
 		/*
 		 * Pay for our earlier safety; deliver the delayed signals from
