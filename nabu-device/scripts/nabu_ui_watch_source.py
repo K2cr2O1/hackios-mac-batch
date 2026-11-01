@@ -1,31 +1,32 @@
 """Reversible, explicitly enabled UI exec and first-main-thread observations."""
 
 CONTRACT = {
-    'version': 1, 'trigger': 'nabu-ui-watch=1',
+    'version': 2, 'trigger': 'nabu-ui-watch=1',
     'targets': ['SpringBoard', 'backboardd', 'runningboardd'],
     'paths': ['/System/Library/CoreServices/SpringBoard.app/SpringBoard',
               '/usr/libexec/backboardd', '/usr/libexec/runningboardd'],
     'symbols': ['_nabu_ui_watch_snapshot', '_nabu_ui_watch_exit_note',
                 '_nabu_ui_watch_activation', '_nabu_ui_watch_signature',
                 '_nabu_ui_watch_release_ready', '_nabu_ui_watch_released',
-                '_nabu_ui_watch_activate_image', '_nabu_ui_watch_thread_state'],
+                '_nabu_ui_watch_activate_image_v2', '_nabu_ui_watch_thread_state'],
     'symbols_by_object': {
         'kern_exec.c': ['_nabu_ui_watch_snapshot', '_nabu_ui_watch_exit_note',
                         '_nabu_ui_watch_activation', '_nabu_ui_watch_signature',
                         '_nabu_ui_watch_release_ready', '_nabu_ui_watch_released',
-                        '_nabu_ui_watch_activate_image'],
+                        '_nabu_ui_watch_activate_image_v2'],
         'thread.c': ['_nabu_ui_watch_thread_state'],
     },
     'symbol_references_by_object': {'kern_exit.c': ['_nabu_ui_watch_exit_note']},
     'max_samples': 64, 'interval_us': 10000000, 'max_threads': 3,
-    'max_events': 96, 'max_exec_contexts': 16, 'max_line_bytes': 256, 'first_incarnation_only': True,
+    'max_events': 96, 'max_exec_contexts': 0, 'max_line_bytes': 256, 'first_incarnation_only': True,
+    'target_association': 'activation-call-output',
     'user_memory_read': False, 'scheduler_changed': False, 'new_worker': False,
     'runtime_qualified': False,
 }
 PREFIX = '#define nabu_gpu_userprobe_exec_snapshot nabu_ui_watch_snapshot\n'
 SUFFIX = '#undef nabu_gpu_userprobe_exec_snapshot\n'
 
-EXEC_HELPER = r'''/* NABU_UI_WATCH_V1: bounded observation, no exec/scheduler policy change.
+EXEC_HELPER = r'''/* NABU_UI_WATCH_V2: bounded observation, no exec/scheduler policy change.
  * This is a BSD unit: struct thread and sched locks are not visible here. The
  * scheduler fields are read by nabu_ui_watch_thread_state in osfmk/kern/thread.c. */
 extern int nabu_ui_watch_thread_state(thread_t, uint32_t *, uint32_t *, uint64_t *);
@@ -61,7 +62,6 @@ static int nabu_ui_enabled_cache = -1;
 static unsigned nabu_ui_closed, nabu_ui_event_count, nabu_ui_event_dropped, nabu_ui_seen_mask;
 static unsigned nabu_ui_sample_busy, nabu_ui_sample_contended, nabu_ui_samples, nabu_ui_text_dropped;
 static uint64_t nabu_ui_next_us;
-static unsigned nabu_ui_context_dropped;
 extern void nabu_capture_append(const char *, unsigned);
 extern void nabu_gpu_userprobe_exec_snapshot(uint32_t out[6]);
 
@@ -98,55 +98,13 @@ nabu_ui_target(const char *name, int path)
     return -1;
 }
 
-/* Synchronous caller context; only the matching executing thread dereferences
- * its own stack output pointer. The writer never accesses this table. */
-struct nabu_ui_context {
-    unsigned phase;
-    uint64_t caller;
-    int *target;
-};
-static struct nabu_ui_context nabu_ui_contexts[16];
-
-static void
-nabu_ui_context_target(int target)
-{
-    uint64_t caller = thread_tid(current_thread());
-    for (unsigned i = 0; i < 16; ++i) {
-        struct nabu_ui_context *context = &nabu_ui_contexts[i];
-        if (__atomic_load_n(&context->phase, __ATOMIC_ACQUIRE) != 2 ||
-            __atomic_load_n(&context->caller, __ATOMIC_RELAXED) != caller) continue;
-        int *out = __atomic_load_n(&context->target, __ATOMIC_RELAXED);
-        if (out) *out = target;
-        return;
-    }
-}
-
 int
-nabu_ui_watch_activate_image(struct image_params *imgp, int *target)
+nabu_ui_watch_activate_image_v2(struct image_params *imgp, int *target)
 {
     *target = -1;
-    struct nabu_ui_context *owned = NULL;
-    if (nabu_ui_enabled() && !__atomic_load_n(&nabu_ui_closed, __ATOMIC_ACQUIRE)) {
-        for (unsigned i = 0; i < 16; ++i) {
-            struct nabu_ui_context *context = &nabu_ui_contexts[i];
-            unsigned empty = 0;
-            if (!__atomic_compare_exchange_n(&context->phase, &empty, 1, 0,
-                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) continue;
-            __atomic_store_n(&context->caller, thread_tid(current_thread()), __ATOMIC_RELAXED);
-            __atomic_store_n(&context->target, target, __ATOMIC_RELAXED);
-            __atomic_store_n(&context->phase, 2, __ATOMIC_RELEASE);
-            owned = context;
-            break;
-        }
-        if (!owned) __atomic_fetch_add(&nabu_ui_context_dropped, 1, __ATOMIC_RELAXED);
-    }
-    /* Exactly the original activation call and unchanged error are returned. */
-    int error = exec_activate_image(imgp);
-    if (owned) {
-        __atomic_store_n(&owned->target, (int *)NULL, __ATOMIC_RELAXED);
-        __atomic_store_n(&owned->phase, 0, __ATOMIC_RELEASE);
-    }
-    return error;
+    /* The scalar is copied while excpath is valid, directly to this caller.
+     * No shared exec table or pointer survives the synchronous activation. */
+    return exec_activate_image(imgp, target);
 }
 
 static void
@@ -184,7 +142,6 @@ void
 nabu_ui_watch_activation(proc_t p, int target, unsigned returned, int result)
 {
     if (!nabu_ui_enabled()) return;
-    if (!returned) nabu_ui_context_target(target);
     if (target >= 0 && target < NABU_UI_TARGETS) nabu_ui_event_note((unsigned)target, p, NULL,
         returned ? "activation_return" : "activation_enter", result);
 }
@@ -346,11 +303,10 @@ nabu_ui_watch_snapshot(uint32_t out[6])
             (state & (NABU_UI_TH_TERMINATE | NABU_UI_TH_TERMINATE2)), instances));
     }
     nabu_ui_emit(line, snprintf(line, sizeof(line),
-        "NabuUI: budget sample=%u us=%llu events=%u pending=%u dropped=%u texts_dropped=%u contexts_dropped=%u sample_contended=%u closing=%u snapshot=non-atomic\n",
+        "NabuUI: budget sample=%u us=%llu events=%u pending=%u dropped=%u texts_dropped=%u target_link=direct sample_contended=%u closing=%u snapshot=non-atomic\n",
         sample, (unsigned long long)now, event_count, pending,
         __atomic_load_n(&nabu_ui_event_dropped, __ATOMIC_RELAXED),
         __atomic_load_n(&nabu_ui_text_dropped, __ATOMIC_RELAXED),
-        __atomic_load_n(&nabu_ui_context_dropped, __ATOMIC_RELAXED),
         __atomic_load_n(&nabu_ui_sample_contended, __ATOMIC_RELAXED), sample == NABU_UI_MAX_SAMPLES));
     if (sample == NABU_UI_MAX_SAMPLES) nabu_ui_close();
     __atomic_store_n(&nabu_ui_sample_busy, 0, __ATOMIC_RELEASE);
@@ -366,7 +322,7 @@ def _once(text, before, after):
 
 
 def exec_source(text, restore=False):
-    marker = '/* NABU_UI_WATCH_V1:'
+    marker = '/* NABU_UI_WATCH_V'
     if marker in text:
         if text.count(EXEC_HELPER) != 1 or any(text.count(after) != 1 for _, after in EXEC_PAIRS):
             raise ValueError('UI watch exec source changed after patching')
@@ -404,6 +360,10 @@ def exit_source(text, restore=False):
     return text
 
 EXEC_PAIRS = (
+    ('static int exec_activate_image(struct image_params *imgp);\n',
+     'static int exec_activate_image(struct image_params *imgp, int *nabu_ui_target_out);\n'),
+    ('static int\nexec_activate_image(struct image_params *imgp)\n{\n',
+     'static int\nexec_activate_image(struct image_params *imgp, int *nabu_ui_target_out)\n{\n'),
     (r'''	/* NABU_GPU_USERPROBE_JOB_V1 */
 	uint32_t nabu_probe = 0;
 	if (PE_parse_boot_argn("nabu-gpu-userprobe", &nabu_probe, sizeof(nabu_probe)) && nabu_probe == 1) {
@@ -564,8 +524,9 @@ EXEC_PAIRS = (
      r'''	nabu_probe_target = !strcmp(excpath, "/usr/bin/nabu-gpu-userprobe") ||
 	    !strcmp(excpath, "/private/var/ngpu/bin/nabu-gpu-userprobe");
 	if (nabu_probe_target) nabu_gpu_userprobe_exec_note(0, proc_getpid(p), 0);
-	if (nabu_ui_enabled()) {
+	if (nabu_ui_enabled() && !__atomic_load_n(&nabu_ui_closed, __ATOMIC_ACQUIRE)) {
 		nabu_ui_activation_target = nabu_ui_target(excpath, 1);
+		*nabu_ui_target_out = nabu_ui_activation_target;
 		nabu_ui_watch_activation(p, nabu_ui_activation_target, 0, 0);
 	}
 '''),
@@ -591,13 +552,13 @@ EXEC_PAIRS = (
     (r'''	error = exec_activate_image(imgp);
 #if defined(HAS_APPLE_PAC)
 ''',
-     r'''	error = nabu_ui_watch_activate_image(imgp, &nabu_ui_exec_target);
+     r'''	error = nabu_ui_watch_activate_image_v2(imgp, &nabu_ui_exec_target);
 #if defined(HAS_APPLE_PAC)
 '''),
     (r'''	error = exec_activate_image(imgp);
 	/* thread and task ref returned for vfexec case */
 ''',
-     r'''	error = nabu_ui_watch_activate_image(imgp, &nabu_ui_exec_target);
+     r'''	error = nabu_ui_watch_activate_image_v2(imgp, &nabu_ui_exec_target);
 	/* thread and task ref returned for vfexec case */
 '''),
     (r'''		error = process_signature(p, imgp);

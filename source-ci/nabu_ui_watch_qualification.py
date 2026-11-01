@@ -101,6 +101,14 @@ def qualify(read, candidate):
     require(contract.get('max_samples') == 64 and contract.get('interval_us') == 10000000 and
             contract.get('max_threads') == 3 and contract.get('targets') ==
             ['SpringBoard', 'backboardd', 'runningboardd'], 'UI scope or budget changed')
+    version = contract.get('version', 1)
+    require(type(version) is int and version in (1, 2), 'Unknown UI observer contract version')
+    if version == 2:
+        require(contract.get('target_association') == 'activation-call-output' and
+                contract.get('max_exec_contexts') == 0 and
+                '_nabu_ui_watch_activate_image_v2' in contract.get('symbols', []) and
+                b'nabu_ui_context' not in exec_source,
+                'UI v2 requires direct activation target association without a context table')
     require(exec_source.count(constants['EXEC_HELPER'].encode()) == 1 and
             all(exec_source.count(after.encode()) == 1 for _, after in constants['EXEC_PAIRS']) and
             all(exit_source.count(after.encode()) == 1 for _, after in constants['EXIT_PAIRS']) and
@@ -130,6 +138,7 @@ def qualify(read, candidate):
                          'definitions': {symbol: actual[symbol] for symbol in wanted}}
     final, _ = candidate_definitions(candidate, METAL_PROFILE, symbols)
     return {'compiled': True, 'trigger': 'nabu-ui-watch=1', 'contract': contract,
+            **({'target_association': contract['target_association']} if version == 2 else {}),
             'generator_sha256': sha(generator), 'exec_source_sha256': sha(exec_source),
             'exit_source_sha256': sha(exit_source), 'thread_source_sha256': sha(thread_source),
             'objects': objects,
