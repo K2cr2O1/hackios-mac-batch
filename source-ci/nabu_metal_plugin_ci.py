@@ -26,7 +26,8 @@ BOARD_ARGUMENTS = ('--scanout-copy', 'on', '--quartzcore-display-state', 'off', 
 # Built by build-adreno-metal-plugin.py but not deployed on nabu; listed in the report only.
 # nabu patches to the pinned AdrenoMetal checkout (paths relative to the device tree), applied in order.
 ADRENOMETAL_PATCHES = ('patches/adrenometal-shader-cache-optional.patch', 'patches/adrenometal-quartzcore-failures.patch',
-                       'patches/adrenometal-nabu-scanout.patch', 'patches/adrenometal-nabu-problem-report.patch')
+                       'patches/adrenometal-nabu-scanout.patch', 'patches/adrenometal-nabu-problem-report.patch',
+                       'patches/adrenometal-nabu-ci-kernels.patch')
 UNDEPLOYED = ('adrenoprobed', 'adrenoprobed-entitlements.plist', 'org.blu-sharky.adrenoprobed.plist',
               'com.apple.iomfb_fdr_loader.plist', 'com.apple.bluetoothd.plist')
 

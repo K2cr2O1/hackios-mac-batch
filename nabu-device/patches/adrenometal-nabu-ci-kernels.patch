@@ -1,0 +1,340 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 5138ece..04a7b7d 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -13,6 +13,7 @@
+ #import <objc/message.h>
+ #include <algorithm>
+ #include <atomic>
++#include <functional>
+ #include <mutex>
+ #include <map>
+ #include <pthread.h>
+@@ -21,6 +22,7 @@
+ #include <unordered_map>
+ #include <vector>
+ #include <sys/mman.h>
++#include <unistd.h>
+ #include <CommonCrypto/CommonDigest.h>
+ #include <dlfcn.h>
+ #include <execinfo.h>
+@@ -91,6 +93,28 @@ static NSError *nbError(NSString *why) {
+  return [NSError errorWithDomain:@"org.blu-sharky.native-metal" code:-1 userInfo:@{NSLocalizedDescriptionKey:why?:@"refused"}];
+ }
+ static NSString *lastError() {return [NSString stringWithUTF8String:nmb_last_error()];}
++// nabu: Core Image's Metal path asks the device for its precompiled kernels (externFunctionNames) and stitches them through the system's
++// Metal compiler (request 14). Both are needed together: without the names Core Image builds a null DAG program, and without stitching the
++// kernels are never made. The image's marker beside the bundle ("ci-kernels=0") turns the path off for a comparison run; every other image
++// keeps it on.
++static bool nabuGpuCiKernelsEnabled() {
++ static bool enabled;static dispatch_once_t once;
++ dispatch_once(&once,^{
++  enabled=true;
++  Dl_info info={};
++  if(!dladdr((const void *)&nabuGpuCiKernelsEnabled,&info) || !info.dli_fname)return;
++  char path[1024];
++  if(snprintf(path,sizeof path,"%s",info.dli_fname)<=0)return;
++  char *slash=strrchr(path,'/');if(!slash)return;*slash=0;   // <dir>/NativeAdrenoMetal.bundle/NativeAdrenoMetal
++  slash=strrchr(path,'/');if(!slash)return;
++  snprintf(slash+1,sizeof path-(size_t)(slash+1-path),"NativeAdrenoMetal.publish");
++  FILE *file=fopen(path,"rb");if(!file)return;
++  char text[32]={};const size_t length=fread(text,1,sizeof text-1,file);fclose(file);
++  text[length]=0;
++  if(strstr(text,"ci-kernels=0"))enabled=false;
++ });
++ return enabled;
++}
+ // The render pipeline journal: one line per render pipeline creation (when, on which thread, how long, the outcome, both functions with
+ // every constant value, the attachments, blending and vertex descriptor) appended to pipelines.log in the runtime's cache directory, which
+ // the board log exports with the caches (CacheExport.h): every pipeline a boot made, or was refused, can be made again on the host.
+@@ -427,12 +451,17 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
+ // ---- libraries, functions, states ----
+ @interface NBLibrary : NBObject
+ @property(nonatomic) NmbLibrary *handle;
++// The metallib these functions came from: function stitching reads each kernel's wrapped bitcode out of it. storage keeps the bytes mapped.
++@property(nonatomic,strong) id storage;
++@property(nonatomic) const uint8_t *bytes;
++@property(nonatomic) size_t length;
+ @end
+ @interface NBFunction : NBObject
+ @property(nonatomic) NmbFunction *handle;
+ @property(nonatomic,copy) NSString *name;
+ @property(nonatomic) MTLFunctionType functionType;
+ @property(nonatomic) std::string constantsText;   // name:type:hex of each constant value it was specialized with (the journal's)
++@property(nonatomic,strong) NBLibrary *library;   // where it came from (stitching reads its bitcode); nil for a runtime function
+ @end
+ @implementation NBFunction
+ - (void)dealloc {nmb_function_release(_handle);}
+@@ -472,9 +501,89 @@ static uint64_t constantBytes(uint64_t type) {
+  }
+ }
+ static std::string quartzCoreCallers();
++// A Core Image kernel library (metallib file_type 1: ci_stdlib, ci_filters, ci_raw, ci_stdlib_h) lists its kernels as TYPE 5 entries over
++// one shared module. Metal names none of them (functionNames is empty) yet answers newFunctionWithName: and
++// newFunctionWithName:constantValues:error: with a function of functionType 4. Core Image's DAG path takes its precompiled kernels so
++// (CI::MetalDAGHelper::get_precompiled_kernel) and stitches them; without them create_metal_dag ends in a null program.
++static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
++static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(const std::string &,int)> &visit);
++// Each entry of a metallib's function list, in file order, as its name and TYPE (-1: none); false for a list that is not well formed.
++static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(const std::string &,int)> &visit) {
++ const uint8_t *file=library.bytes;const size_t length=library.length;
++ if(!file || length<88 || memcmp(file,"MTLB",4))return false;
++ uint64_t listAt;memcpy(&listAt,file+24,8);
++ if(listAt>length-4)return false;
++ uint32_t count;memcpy(&count,file+listAt,4);
++ size_t at=listAt+4;
++ for(uint32_t i=0;i<count;i++) {
++  uint32_t size;if(at>length-4)return false;memcpy(&size,file+at,4);
++  if(size<8 || size>length-at)return false;
++  const size_t end=at+size;
++  std::string entry;int type=-1;
++  for(size_t t=at+4;t+4<=end && memcmp(file+t,"ENDT",4);) {
++   if(t+6>end)return false;
++   uint16_t n;memcpy(&n,file+t+4,2);const uint8_t *v=file+t+6;
++   if(n>end-(t+6))return false;
++   if(!memcmp(file+t,"NAME",4))entry.assign((const char *)v,strnlen((const char *)v,n));
++   else if(!memcmp(file+t,"TYPE",4) && n>=1)type=v[0];
++   t+=6+n;
++  }
++  if(!visit(entry,type))return true;
++  at=end;
++ }
++ return true;
++}
++static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
++ if(!nabuGpuCiKernelsEnabled())return nil;
++ const uint8_t *file=library.bytes;const char *wanted=name.UTF8String;
++ if(!file || !wanted || library.length<88 || file[10]!=1)return nil;
++ NBFunction *found=nil;
++ forEachLibraryEntry(library,[&](const std::string &entry,int type) {
++  if(entry!=wanted)return true;
++  if(type==5) {
++   found=[NBFunction new];found.name=name;found.functionType=(MTLFunctionType)4;found.library=library;
++  }
++  return false;
++ });
++ return found;
++}
++// A function's wrapped bitcode in its library's metallib: the function list's entry NAMEd as the function, MDSZ bytes at OFFT's bitcode
++// offset into the bitcode section (header: function list at 24, bitcode section offset and size at 72 and 80; tags a fourcc, a u16
++// length and the bytes, up to ENDT).
++static NSData *functionBitcode(NBFunction *function) {
++ NBLibrary *library=function.library;const uint8_t *file=library.bytes;const size_t length=library.length;
++ const char *wanted=function.name.UTF8String;
++ if(!file || !wanted || length<88 || memcmp(file,"MTLB",4))return nil;
++ uint64_t listAt,bitcodeAt,bitcodeSize;memcpy(&listAt,file+24,8);memcpy(&bitcodeAt,file+72,8);memcpy(&bitcodeSize,file+80,8);
++ if(listAt>length-4 || bitcodeAt>length || bitcodeSize>length-bitcodeAt)return nil;
++ uint32_t count;memcpy(&count,file+listAt,4);
++ size_t at=listAt+4;
++ for(uint32_t i=0;i<count;i++) {
++  uint32_t size;if(at>length-4)return nil;memcpy(&size,file+at,4);
++  if(size<8 || size>length-at)return nil;
++  const size_t end=at+size;
++  std::string name;uint64_t bytes=0,offset=0;bool sized=false,placed=false;
++  for(size_t t=at+4;t+4<=end && memcmp(file+t,"ENDT",4);) {
++   if(t+6>end)return nil;
++   uint16_t n;memcpy(&n,file+t+4,2);const uint8_t *v=file+t+6;
++   if(n>end-(t+6))return nil;
++   if(!memcmp(file+t,"NAME",4))name.assign((const char *)v,strnlen((const char *)v,n));
++   else if(!memcmp(file+t,"MDSZ",4) && n>=8){memcpy(&bytes,v,8);sized=true;}
++   else if(!memcmp(file+t,"OFFT",4) && n>=24){memcpy(&offset,v+16,8);placed=true;}
++   t+=6+n;
++  }
++  if(name==wanted) {
++   if(!sized || !placed || offset>bitcodeSize || bytes>bitcodeSize-offset)return nil;
++   return [NSData dataWithBytes:file+bitcodeAt+offset length:(NSUInteger)bytes];
++  }
++  at=end;
++ }
++ return nil;
++}
+ @implementation NBLibrary
+ - (void)dealloc {nmb_library_release(_handle);}
+ - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
++ if(NBFunction *kernel=ciKernelFunction(self,name)){if(error)*error=nil;return (id<MTLFunction>)kernel;}
+  if(!name || !values || !methodABI(values,@selector(newIndexedConstantArray),"@16@0:8") || !methodABI(values,@selector(newNamedConstantArray),"@16@0:8")) {
+   if(error)*error=nbError(@"unqualified function constant values");return nil;
+  }
+@@ -511,7 +620,7 @@ static std::string quartzCoreCallers();
+   if(error)*error=nbError([NSString stringWithFormat:@"specialized function: %@",lastError()]);return nil;
+  }
+  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
+- function.constantsText=text;if(error)*error=nil;return (id<MTLFunction>)function;
++ function.library=self;function.constantsText=text;if(error)*error=nil;return (id<MTLFunction>)function;
+ }
+ - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
+  NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values error:&error];
+@@ -534,12 +643,24 @@ static std::string quartzCoreCallers();
+  }
+  return names;
+ }
++// _MTLLibrary's externFunctionNames: the entries of external linkage (TYPE 5), an empty array for a library without any. Core Image
++// collects the precompiled kernels so (DAGPrecompiledKernels) and links a kernel into its DAG only when its name is there.
++- (NSArray<NSString *> *)externFunctionNames {
++ if(!nabuGpuCiKernelsEnabled()){[self doesNotRecognizeSelector:_cmd];return nil;}
++ NSMutableArray<NSString *> *names=[NSMutableArray array];
++ forEachLibraryEntry(self,[&](const std::string &entry,int type) {
++  if(type==5 && !entry.empty())if(NSString *name=@(entry.c_str()))[names addObject:name];
++  return true;
++ });
++ return names;
++}
+ - (id<MTLFunction>)newFunctionWithName:(NSString *)name {
++ if(NBFunction *kernel=ciKernelFunction(self,name))return (id<MTLFunction>)kernel;
+  const uint64_t functionBegan=nowUs();
+  NmbFunction *handle=name?nmb_function_new(_handle,name.UTF8String):nullptr;gTimeFunction.add(functionBegan);
+  if(!handle)return nil;
+  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
+- return (id<MTLFunction>)function;
++ function.library=self;return (id<MTLFunction>)function;
+ }
+ @end
+ @interface NBComputePipeline : NBObject
+@@ -1508,6 +1629,74 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  return true;
+ }
+ 
++// Core Image's kernel stitching goes through Metal's own compiler service. The system's MTLCompiler.framework exports
++// MTLCodeGenServiceCreate/BuildRequest; a request is a type, tagged fields and bytes, and the reply is a metallib. One service per
++// process, one request at a time, on a thread with a large stack: the compiler was written for the compiler service's threads and a
++// dispatch worker's stack was too small for it.
++typedef void (^NBCodeGenReply)(int32_t status,const void *reply,size_t length,const char *message);
++static void *runCompilerBlock(void *block) {@autoreleasepool {((__bridge void (^)(void))block)();}return nullptr;}
++static void onLargeStack(void (^body)(void)) {
++ pthread_attr_t attr;pthread_t thread;
++ if(pthread_attr_init(&attr)){body();return;}
++ const bool made=!pthread_attr_setstacksize(&attr,16u<<20) && !pthread_create(&thread,&attr,runCompilerBlock,(__bridge void *)body);
++ pthread_attr_destroy(&attr);
++ if(made)pthread_join(thread,nullptr);else body();
++}
++static NSData *codeGenRequest(uint32_t type,const std::vector<uint8_t> &request,NSString **warnings,NSString **failure) {
++ static void *service;
++ static void (*build)(void *,void *,uint32_t,const void *,size_t,NBCodeGenReply);
++ static dispatch_once_t once;
++ static std::mutex lock;
++ dispatch_once(&once,^{
++  static const char kFramework[]="/System/Library/PrivateFrameworks/MTLCompiler.framework";
++  // The top-level path, then the version the framework's own Current link names, then the highest version directory: every version's
++  // library exports the same codegen service.
++  std::string path=std::string(kFramework)+"/MTLCompiler";
++  void *library=dlopen(path.c_str(),RTLD_NOW);
++  if(!library && !access((std::string(kFramework)+"/Versions/Current/MTLCompiler").c_str(),R_OK)) {
++   path=std::string(kFramework)+"/Versions/Current/MTLCompiler";
++   library=dlopen(path.c_str(),RTLD_NOW);
++  }
++  if(!library) {
++   unsigned long highest=0;
++   for(NSString *entry in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:[@(kFramework) stringByAppendingString:@"/Versions"] error:nil]) {
++    const unsigned long version=(unsigned long)[entry longLongValue];
++    if(version>highest && [entry isEqualToString:[NSString stringWithFormat:@"%lu",version]])highest=version;
++   }
++   if(highest) {path=std::string(kFramework)+"/Versions/"+std::to_string(highest)+"/MTLCompiler";library=dlopen(path.c_str(),RTLD_NOW);}
++  }
++  if(!library)NBLOG(@"native-metal: the system's Metal compiler is not available");
++  void *(*create)(const char *)=library?(void *(*)(const char *))dlsym(library,"MTLCodeGenServiceCreate"):nullptr;
++  build=library?(void (*)(void *,void *,uint32_t,const void *,size_t,NBCodeGenReply))dlsym(library,"MTLCodeGenServiceBuildRequest"):nullptr;
++  service=create && build?create("native-metal"):nullptr;
++ });
++ if(!service){if(failure)*failure=@"the system's Metal compiler (MTLCompiler.framework) is not available";return nil;}
++ __block NSData *metallib=nil;
++ __block NSString *warned=nil,*message=nil;
++ __block bool called=false;
++ {
++  std::lock_guard<std::mutex> guard(lock);
++  onLargeStack(^{build(service,nullptr,type,request.data(),request.size(),^(int32_t status,const void *reply,size_t length,const char *why) {
++   called=true;
++   uint32_t header=0,warning=0;
++   if(reply && length>=16){memcpy(&header,(const uint8_t *)reply+8,4);memcpy(&warning,(const uint8_t *)reply+12,4);}
++   if(status || !reply || length<16 || (uint64_t)header+warning>length) {
++    message=why && *why?@(why):[NSString stringWithFormat:@"the Metal compiler failed (status %d)",status];
++    return;
++   }
++   if(warning)warned=[[NSString alloc] initWithBytes:(const uint8_t *)reply+header length:warning encoding:NSUTF8StringEncoding];
++   metallib=[NSData dataWithBytes:(const uint8_t *)reply+header+warning length:length-header-warning];
++  });});
++ }
++ if(!called)message=@"the Metal compiler did not answer";
++ if(warnings)*warnings=warned;
++ if(failure)*failure=message;
++ return message?nil:metallib;
++}
++// Metal's own DAG text for a set of function stitching graphs: _MTLDevice implements it, and the frontend's device inherits it.
++@protocol NBOriginalStitching
++- (NSString *)newDagStringWithGraphs:(NSArray<MTLFunctionStitchingGraph *> *)graphs;
++@end
+ @interface NBDeviceMethods : NSObject
+ @end
+ @implementation NBDeviceMethods
+@@ -1657,14 +1846,16 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  const uint64_t libraryBegan=nowUs();
+  NmbLibrary *handle=nmb_library_new(gDevice,bytes,size,false);(void)mapped;gTimeLibrary.add(libraryBegan);
+  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
+- NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
++ NBLibrary *library=[NBLibrary new];library.handle=handle;library.storage=mapped;library.bytes=(const uint8_t *)bytes;
++ library.length=size;if(error)*error=nil;return (id<MTLLibrary>)library;
+ }
+ - (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error {
+  NSData *bytes=path?[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error]:nil;if(!bytes)return nil;
+  const uint64_t libraryBegan=nowUs();
+  NmbLibrary *handle=nmb_library_new(gDevice,bytes.bytes,bytes.length,false);gTimeLibrary.add(libraryBegan);
+  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
+- NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
++ NBLibrary *library=[NBLibrary new];library.handle=handle;library.storage=bytes;library.bytes=(const uint8_t *)bytes.bytes;
++ library.length=bytes.length;if(error)*error=nil;return (id<MTLLibrary>)library;
+ }
+ - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)error {
+  if(!url.isFileURL){if(error)*error=nbError(@"a file URL is required");return nil;}
+@@ -1676,6 +1867,53 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  return [(id<MTLDevice>)self newLibraryWithURL:url error:error];
+ }
+ - (id<MTLLibrary>)newDefaultLibrary {return [(id<MTLDevice>)self newDefaultLibraryWithBundle:[NSBundle mainBundle] error:nil];}
++// Core Image's create_metal_dag: Metal's own DAG text for the graphs, then each function's wrapped bitcode, compiled by the system's
++// Metal compiler into a metallib this device loads. Metal's own path refuses these function objects (they are the frontend's).
++- (id<MTLLibrary>)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)d error:(NSError **)error {
++ if(!nabuGpuCiKernelsEnabled()){if(error)*error=nbError(@"the Core Image Metal kernel path is off");return nil;}
++ NSArray<MTLFunctionStitchingGraph *> *graphs=d.functionGraphs;NSArray<id<MTLFunction>> *functions=d.functions;
++ if(!graphs.count || !functions.count){if(error)*error=nbError(@"a stitched library needs graphs and functions");return nil;}
++ NSString *dag=[(id<NBOriginalStitching>)self newDagStringWithGraphs:graphs];
++ if(!dag.length){if(error)*error=nbError(@"the stitching graphs have no DAG text");return nil;}
++ std::vector<uint8_t> request;
++ auto word=[&](uint32_t v){const uint8_t *b=(const uint8_t *)&v;request.insert(request.end(),b,b+4);};
++ const char *text=dag.UTF8String;
++ word(0x64616720 /* 'dag ' */);request.insert(request.end(),text,text+strlen(text)+1);
++ word(0x6e756d66 /* 'numf' */);word((uint32_t)functions.count);
++ for(id function in functions) {
++  NSData *bitcode=[function isKindOfClass:[NBFunction class]]?functionBitcode((NBFunction *)function):nil;
++  if(!bitcode) {
++   NSString *why=[NSString stringWithFormat:@"stitched function %@ has no bitcode here",[function name]];
++   noteProblem(why);if(error)*error=nbError(why);return nil;
++  }
++  word(0x62697463 /* 'bitc' */);word((uint32_t)bitcode.length);
++  const uint8_t *b=(const uint8_t *)bitcode.bytes;request.insert(request.end(),b,b+bitcode.length);
++ }
++ // The compiler reads three more tagged slots after the functions and aborts when the request ends before them: 'nums' the script
++ // count, 'ptfm' the platform and 'arid' an archive id; none of them, as zeros.
++ word(0x6e756d73 /* 'nums' */);word(0);word(0x7074666d /* 'ptfm' */);word(0);word(0x61726964 /* 'arid' */);word(0);
++ NSString *warnings=nil,*failure=nil;
++ NSData *metallib=codeGenRequest(14,request,&warnings,&failure);
++ if(!metallib) {
++  NSString *why=failure?:@"the Metal compiler refused the stitched library";
++  if(why.length>120)why=[why substringToIndex:120];
++  noteProblem([@"stitched library: " stringByAppendingString:why]);
++  if(error)*error=nbError(failure?:@"the Metal compiler refused the stitched library");
++  return nil;
++ }
++ dispatch_data_t data=dispatch_data_create(metallib.bytes,metallib.length,nullptr,^{ (void)metallib; });
++ return [(id<MTLDevice>)self newLibraryWithData:data error:error];
++}
++- (id<MTLLibrary>)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)d destinationBinaryArchive:(id<MTLBinaryArchive>)archive error:(NSError **)error {
++ (void)archive;return [(id<MTLDevice>)self newLibraryWithStitchedDescriptor:d error:error];
++}
++- (void)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)d completionHandler:(MTLNewLibraryCompletionHandler)handler {
++ dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
++  NSError *error=nil;
++  id<MTLLibrary> library=[(id<MTLDevice>)self newLibraryWithStitchedDescriptor:d error:&error];
++  if(handler)handler(library,error);
++ });
++}
+ - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function error:(NSError **)error {
+  return [(id<MTLDevice>)self newComputePipelineStateWithFunction:function options:MTLPipelineOptionNone reflection:nil error:error];
+ }
