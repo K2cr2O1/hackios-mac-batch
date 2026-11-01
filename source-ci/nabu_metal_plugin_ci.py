@@ -28,6 +28,7 @@ BOARD_ARGUMENTS = ('--scanout-copy', 'on', '--quartzcore-display-state', 'off', 
 ADRENOMETAL_PATCHES = ('patches/adrenometal-shader-cache-optional.patch', 'patches/adrenometal-quartzcore-failures.patch',
                        'patches/adrenometal-nabu-scanout.patch', 'patches/adrenometal-nabu-problem-report.patch',
                        'patches/adrenometal-nabu-ci-kernels.patch')
+FPS_PATCHES = ADRENOMETAL_PATCHES[:-1] + ('patches/adrenometal-nabu-source-cache.patch',)
 UNDEPLOYED = ('adrenoprobed', 'adrenoprobed-entitlements.plist', 'org.blu-sharky.adrenoprobed.plist',
               'com.apple.iomfb_fdr_loader.plist', 'com.apple.bluetoothd.plist')
 
@@ -55,7 +56,13 @@ def fetch(path, url, commit, *, blob_filter=False):
         raise SystemExit('Pinned checkout differs: ' + str(path))
 
 
-def prepare(root, device):
+def plugin_patches(fps_opt=False):
+    # The FPS experiment starts from the four-patch, desktop-capable plugin.
+    # Preserve the separate CoreImage experiment instead of mixing its changes in.
+    return FPS_PATCHES if fps_opt else ADRENOMETAL_PATCHES
+
+
+def prepare(root, device, fps_opt=False):
     for path, (url, commit) in SUBMODULES.items():
         entry = read(['git', '-C', root, 'ls-tree', 'HEAD', path]).split()
         if entry[:3] != ['160000', 'commit', commit]:
@@ -65,11 +72,13 @@ def prepare(root, device):
             raise SystemExit('Submodule path is not empty: ' + path)
         fetch(target, url, commit)
     metal = root / 'drivers/AdrenoMetal'
-    for patch in ADRENOMETAL_PATCHES:
+    for patch in plugin_patches(fps_opt):
         run(['git', '-C', metal, 'apply', '--check', device / patch])
         run(['git', '-C', metal, 'apply', device / patch])
     shutil.copyfile(device / 'platform/NabuGpuScanoutWire.h', metal / 'NabuGpuScanoutWire.h')
     shutil.copyfile(device / 'platform/NabuGpuProblemStream.h', metal / 'NabuGpuProblemStream.h')
+    if fps_opt:
+        shutil.copyfile(device / 'platform/NabuScanoutSourceCache.h', metal / 'NabuScanoutSourceCache.h')
     pins = json.loads((root / 'scripts/data/gpu-metal-vulkan-inputs.json').read_text())
     translator = pins['translator']['commit']
     if pins['translator']['repository'].rstrip('/') + '.git' != METAL2VULKAN:
@@ -91,7 +100,7 @@ def bundle_files(bundle):
     return files
 
 
-def build(root, device, output, env):
+def build(root, device, output, env, fps_opt=False):
     """Returns the report's plugin section; the build's own return code is plugin['plugin_returncode']."""
     root, device, output = Path(root), Path(device).resolve(), Path(output)
     abi = device / 'gpu/upstream/Adreno6xx'
@@ -99,8 +108,24 @@ def build(root, device, output, env):
     report = {'adrenometal_commit': SUBMODULES['drivers/AdrenoMetal'][1],
               'adrenopm4_commit': SUBMODULES['kits/AdrenoPM4'][1], 'rust_toolchain': RUST,
               'abi_header_sha256': sha(abi / 'NativeAdrenoABI.h'), 'gpu_exercised': False, 'runtime_qualified': False}
-    report['metal2vulkan_commit'] = prepare(root, device)
-    report['adrenometal_patches'] = {patch: sha(device / patch) for patch in ADRENOMETAL_PATCHES}
+    report['metal2vulkan_commit'] = prepare(root, device, fps_opt)
+    report['adrenometal_patches'] = {patch: sha(device / patch) for patch in plugin_patches(fps_opt)}
+    report['fps_opt'] = fps_opt
+    if fps_opt:
+        report['scanout_source_cache'] = {
+            'version': 1, 'slots': 8, 'slot_identity': 'NGPSwap.reserved',
+            'kernel_maps_must_not_evict': True, 'gpu_completion_required': True,
+            'coreimage_patch_applied': False,
+            'header_sha256': sha(device / 'platform/NabuScanoutSourceCache.h'),
+            'runtime_qualified': False,
+        }
+        sources = ('GpuScanoutPresenter.h', 'GpuScanoutClient.h', 'NativeMetalBridgePhase.h',
+                   'NabuScanoutSourceCache.h')
+        source_output = output / 'fps-source'
+        source_output.mkdir()
+        for name in sources:
+            shutil.copyfile(root / 'drivers/AdrenoMetal' / name, source_output / name)
+        report['fps_source_sha256'] = {name: sha(source_output / name) for name in sources}
     report['scanout_wire_sha256'] = sha(device / 'platform/NabuGpuScanoutWire.h')
     report['problem_stream_sha256'] = sha(device / 'platform/NabuGpuProblemStream.h')
     report['rust_version'] = read(['rustc', '+' + RUST, '--version'])

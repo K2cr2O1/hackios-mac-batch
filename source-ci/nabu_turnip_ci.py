@@ -93,7 +93,10 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--plugin', action='store_true',
                         help='also build NativeAdrenoMetal.bundle (nabu_metal_plugin_ci.py) on the built Turnip')
+    parser.add_argument('--fps-opt', action='store_true',
+                        help='build the bounded scanout-source cache experiment on the four-patch plugin baseline')
     args = parser.parse_args()
+    require(not args.fps_opt or args.plugin, '--fps-opt requires --plugin')
     require(sys.platform == 'darwin' and os.environ.get('GITHUB_ACTIONS') == 'true', 'Run only in macOS GitHub Actions')
     device, root, output = args.device.resolve(), args.work.resolve(), args.output.resolve()
     abi = device / 'gpu/upstream/Adreno6xx'
@@ -161,7 +164,7 @@ def main():
             sys.path.insert(0, str(Path(__file__).resolve().parent))
             import nabu_metal_plugin_ci
             try:
-                plugin = nabu_metal_plugin_ci.build(root, device, output / 'plugin', env)
+                plugin = nabu_metal_plugin_ci.build(root, device, output / 'plugin', env, fps_opt=args.fps_opt)
             except (subprocess.CalledProcessError, SystemExit, OSError, ValueError, KeyError) as error:
                 plugin = {'plugin_returncode': 1, 'bundle_built': False, 'error': str(error)[-2000:],
                           'gpu_exercised': False, 'runtime_qualified': False}

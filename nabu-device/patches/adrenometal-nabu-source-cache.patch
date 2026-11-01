@@ -1,0 +1,93 @@
+diff --git a/GpuScanoutPresenter.h b/GpuScanoutPresenter.h
+--- a/GpuScanoutPresenter.h
++++ b/GpuScanoutPresenter.h
+@@ -8,6 +8,7 @@
+ #include <unistd.h>
+ #include <stdint.h>
+ #include <string.h>
++#include "NabuScanoutSourceCache.h"
+ 
+ namespace gpupresent {
+ 
+@@ -35,15 +36,31 @@
+         target_ = [device newBufferWithBytesNoCopy:scanout.base length:scanout.bytes options:MTLResourceStorageModeShared deallocator:nil];
+     }
+     bool ready() const { return target_ != nil; }
++    uint64_t sourceImports() const { return sources_.imports(); }
++    uint64_t sourceHits() const { return sources_.hits(); }
+     // One frame: encodes the GPU copy, commits, waits for the GPU. Rows are copied as whole rows of width*4 bytes.
+-    Result present(const Frame &frame) {
++    Result present(const Frame &frame, uint32_t sourceSlot = 0) {
+         if (!ready()) return kBadScanout;
+         const size_t page = (size_t)getpagesize(), row = (size_t)frame.width * 4;
+         if (!frame.base || ((uintptr_t)frame.base & (page - 1)) || !frame.bytes || (frame.bytes & (page - 1)) ||
+             frame.width != scanout_.width || frame.height != scanout_.height || frame.stride < row ||
+             (size_t)frame.height > frame.bytes / frame.stride || frame.stride * (frame.height - 1) + row > frame.bytes) return kBadFrame;
+-        id<MTLBuffer> source = [device_ newBufferWithBytesNoCopy:(void *)frame.base length:frame.bytes options:MTLResourceStorageModeShared deallocator:nil];
+-        if (!source) return kNoResource;
++        // Only a kernel slot may skip a new import: its map is retained until reboot.
++        // A generic caller (slot 0) keeps the original no-copy import semantics.
++        const auto match = sourceSlot ? sources_.match(sourceSlot, frame.base, frame.bytes) : nabu_scanout::SourceCache::Empty;
++        if (match == nabu_scanout::SourceCache::Invalid) return kBadFrame;
++        id<MTLBuffer> source = nil;
++        if (sourceSlot && match == nabu_scanout::SourceCache::Same) {
++            source = heldSources_[sourceSlot - 1];
++            if (!source || !sources_.reused(sourceSlot, frame.base, frame.bytes)) return kBadFrame;
++        } else {
++            source = [device_ newBufferWithBytesNoCopy:(void *)frame.base length:frame.bytes options:MTLResourceStorageModeShared deallocator:nil];
++            if (!source) return kNoResource;
++            if (sourceSlot) {
++                if (!sources_.imported(sourceSlot, frame.base, frame.bytes)) return kBadFrame;
++                heldSources_[sourceSlot - 1] = source;
++            }
++        }
+         id<MTLCommandBuffer> commands = [queue_ commandBuffer];
+         id<MTLBlitCommandEncoder> blit = commands ? [commands blitCommandEncoder] : nil;
+         if (!blit) return kNoResource;
+@@ -83,6 +100,8 @@
+     Scanout scanout_;
+     id<MTLCommandQueue> queue_;
+     id<MTLBuffer> target_;
++    nabu_scanout::SourceCache sources_;
++    id<MTLBuffer> __strong heldSources_[nabu_scanout::SourceCache::Slots] = {};
+ };
+ 
+ }  // namespace gpupresent
+diff --git a/GpuScanoutClient.h b/GpuScanoutClient.h
+--- a/GpuScanoutClient.h
++++ b/GpuScanoutClient.h
+@@ -26,6 +26,7 @@
+ 
+ struct Stats {
+     uint64_t frames, failures, timeouts;
++    uint64_t sourceImports, sourceHits;
+     int lastResult;     // gpupresent::Result of the last frame
+     int step;           // 0 idle, 2 mode refused, 3 scanout not mappable/importable, 4 serving
+     int error;          // the failing call's return, when there is one
+@@ -81,7 +82,9 @@
+         note(0x6730);   // a frame was offered
+         const uint64_t began = mach_absolute_time();
+         const gpupresent::Result r = presenter_->present({(const void *)(uintptr_t)swap.address, (size_t)((swap.bytes + page - 1) & ~(page - 1)),
+-                                                          (size_t)swap.stride, swap.width, swap.height});
++                                                          (size_t)swap.stride, swap.width, swap.height}, swap.reserved);
++        stats_->sourceImports = presenter_->sourceImports();
++        stats_->sourceHits = presenter_->sourceHits();
+         {
+             static mach_timebase_info_data_t base;
+             if (!base.denom) mach_timebase_info(&base);
+diff --git a/NativeMetalBridgePhase.h b/NativeMetalBridgePhase.h
+--- a/NativeMetalBridgePhase.h
++++ b/NativeMetalBridgePhase.h
+@@ -138,9 +138,10 @@
+                     reportedFrames = st.frames ? st.frames : reportedFrames;
+                     reportedFailures = st.failures ? st.failures : reportedFailures;
+                     const uint64_t served = st.frames + st.failures;
+-                    snprintf(line, sizeof line, "PF %llu/%llu r%d v%llu/%llu t%u a%llu", (unsigned long long)st.frames, (unsigned long long)st.failures,
++                    snprintf(line, sizeof line, "PF %llu/%llu r%d v%llu/%llu t%u a%llu i%llu h%llu", (unsigned long long)st.frames, (unsigned long long)st.failures,
+                              st.lastResult, (unsigned long long)st.verified, (unsigned long long)st.mismatchRows, st.lastMs,
+-                             (unsigned long long)(served ? st.totalMs / served : 0));
++                             (unsigned long long)(served ? st.totalMs / served : 0),
++                             (unsigned long long)st.sourceImports, (unsigned long long)st.sourceHits);
+                     streamText7(gpu, line);
+                 }
+             }
