@@ -232,6 +232,8 @@ def selected_sources(device):
         (device / 'platform/NabuLegacyDiscovery.cpp', 'device/platform/NabuLegacyDiscovery.cpp'),
         (device / 'platform/NabuKeybagNotifications.cpp', 'device/platform/NabuKeybagNotifications.cpp'),
         (device / 'platform/NabuLegacyCpuPixels.h', 'device/platform/NabuLegacyCpuPixels.h'),
+        (device / 'platform/NabuGpuScanoutHandoff.h', 'device/platform/NabuGpuScanoutHandoff.h'),
+        (device / 'platform/NabuGpuScanoutWire.h', 'device/platform/NabuGpuScanoutWire.h'),
         (device / 'platform/NabuLegacyCpuPresent.cpp', 'device/platform/NabuLegacyCpuPresent.cpp'),
         (device / 'scripts/nabu_cpu_abi.py', 'device/scripts/nabu_cpu_abi.py'),
         (device / 'configs/nabu_qemu_cpu_present_defconfig', 'device/configs/nabu_qemu_cpu_present_defconfig'),

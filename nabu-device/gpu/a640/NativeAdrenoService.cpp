@@ -31,6 +31,10 @@ extern "C" volatile uint32_t native_adreno_pool_mib;
 #if defined(NABU_GPU_METAL) && NABU_GPU_METAL
 /* Publication path. The diagnostic archive links none of these objects, so
  * they must not be referenced there. */
+#include "NativeAdrenoIntegration.h"
+extern "C" IOReturn nabu_gpu_scanout_display_call(uint32_t,task_t,const void *,const void *,size_t,void *,size_t);
+extern "C" IOMemoryDescriptor *nabu_gpu_scanout_display_memory(task_t,const void *);
+extern "C" void nabu_gpu_scanout_display_close(const void *);
 extern "C" IOReturn native_adreno_initialize_classes(void);
 extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *,NativeAdrenoSubmit *,NativeAdrenoRing *,
     const NativeAdrenoRingClock *,const NativeAdrenoTimer *,const NativeAdrenoAbiDeviceInfo *,uint32_t,uint32_t);
@@ -74,6 +78,10 @@ extern volatile uint32_t armcpu_smp_step[8],armcpu_smp_mpidr[8],armcpu_smp_seen_
 extern volatile uint32_t armcpu_smp_sys[8][5],armcpu_core_timer[8],armcpu_core_sgi[8];
 extern volatile int32_t armcpu_smp_psci_rc[8];
 extern volatile uint64_t armcpu_ipi_interrupts,armcpu_ipi_sent;
+extern volatile uint64_t nabu_scanout_offers,nabu_scanout_completed,nabu_scanout_fallbacks;
+extern volatile uint64_t nabu_scanout_waits,nabu_scanout_timeouts,nabu_scanout_abandoned;
+extern volatile uint64_t nabu_scanout_maps,nabu_scanout_map_hits;
+extern volatile uint32_t nabu_scanout_ready,nabu_scanout_last_status,nabu_scanout_pending;
 extern unsigned int real_ncpus;
 extern uint32_t processor_avail_count;
 unsigned int ml_get_cpu_count(void);
@@ -186,6 +194,16 @@ void nabuGpuProbeWriterSample()
             "NabuGPU: writer_open=%u slot=%u process=%.*s type=%08x macf=%x resolver=%x attach=%u foreign=%u\n",
             sample,index,20,open.name,open.type,open.macf,open.res,open.attach,open.foreign));
     }
+    emit(snprintf(line,sizeof(line),
+        "NabuGPU: writer_scanout=%u ready=%u pending=%u offered=%llu done=%llu fallback=%llu status=%x\n",
+        sample,nabu_scanout_ready,nabu_scanout_pending,
+        static_cast<unsigned long long>(nabu_scanout_offers),static_cast<unsigned long long>(nabu_scanout_completed),
+        static_cast<unsigned long long>(nabu_scanout_fallbacks),nabu_scanout_last_status));
+    emit(snprintf(line,sizeof(line),
+        "NabuGPU: writer_scanout_wait=%u calls=%llu timeout=%llu abandoned=%llu maps=%llu hits=%llu\n",
+        sample,static_cast<unsigned long long>(nabu_scanout_waits),static_cast<unsigned long long>(nabu_scanout_timeouts),
+        static_cast<unsigned long long>(nabu_scanout_abandoned),static_cast<unsigned long long>(nabu_scanout_maps),
+        static_cast<unsigned long long>(nabu_scanout_map_hits)));
     /* Which cores ArmCpu started and the scheduler counts them in: slot 0 (boot core)
      * always, a secondary slot once ArmCpu has touched it. */
     emit(snprintf(line,sizeof(line),
@@ -1088,7 +1106,10 @@ IOReturn A640State::startCp()
     info_.ubwc_swizzle=6;                     /* UBWC 3.0 keeps bank swizzle levels 2 and 3. */
     info_.macrotile_mode=0;                   /* 4 channels; 8-channel mode starts at UBWC 3.1. */
     info_.ubwc_version=resources_.ubwcMode;   /* ADT qcom,ubwc-mode 3 */
-    info_.flags=NativeAdrenoDeviceClientIova; /* no cached-coherent claim yet */
+    info_.flags=NativeAdrenoDeviceClientIova; /* import capabilities come from the VM */
+    const NativeAdrenoIntegration callbacks={nabu_gpu_scanout_display_call,nabu_gpu_scanout_display_memory,
+        nullptr,nabu_gpu_scanout_display_close};
+    native_adreno_set_integration(&callbacks);
     const IOReturn published=native_adreno_publish(gpuContext_.vm(),&submit_,&ring_,&clock_,
         &timer_,&info_,32,gpuContextReport_.output_bits);
     if(published) {

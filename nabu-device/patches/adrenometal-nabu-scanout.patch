@@ -1,0 +1,36 @@
+diff --git a/GpuScanoutClient.h b/GpuScanoutClient.h
+--- a/GpuScanoutClient.h
++++ b/GpuScanoutClient.h
+@@ -10,7 +10,7 @@
+ #include <stdint.h>
+ #include <unistd.h>
+ #include "GpuScanoutPresenter.h"
+-#include "../NativeMobileDisplay/NativeGOPWire.h"
++#include "NabuGpuScanoutWire.h"
+ 
+ namespace gpuscanout {
+ 
+@@ -91,7 +91,11 @@
+         stats_->lastResult = (int)r;
+         if (r == gpupresent::kOk && stats_->verified < 4) verify(swap);
+         note(0x6731);   // the GPU copy returned
+-        NGPComplete done = {swap.sequence, r == gpupresent::kOk ? 0u : 0xe00002bcu /* kIOReturnError */, 0};
++        // A failed GPU completion can leave DMA in flight. The kernel retains the frame
++        // on NotResponding; other failures occurred before a GPU submission.
++        const uint32_t statusCode = r == gpupresent::kOk ? 0u :
++            r == gpupresent::kGpuFailed ? 0xe00002edu /* kIOReturnNotResponding */ : 0xe00002bcu;
++        NGPComplete done = {swap.sequence, statusCode, 0};
+         const int completed = transport_.call(transport_.context, NGP_METHOD_COMPLETE_SWAP, &done, sizeof done, nullptr, 0);
+         if (completed) {++stats_->failures; stats_->error = completed; return false;}
+         if (r == gpupresent::kOk) ++stats_->frames; else ++stats_->failures;
+diff --git a/NativeMetalBridgePhase.h b/NativeMetalBridgePhase.h
+--- a/NativeMetalBridgePhase.h
++++ b/NativeMetalBridgePhase.h
+@@ -98,6 +98,7 @@
+ struct ScanoutContext {
+     Gpu link;
+     Gpu *marker;
++    ~ScanoutContext() { if (link.conn && link.closeFn) link.closeFn(link.conn); }
+ };
+ static void serveScanout(Gpu &gpu, id device) {
+     // This thread carries every frame to the screen; at the default priority it waited behind the launching apps' threads.

@@ -10,9 +10,10 @@
  * Display callbacks synchronize their own state and may run concurrently.
  * Export fragment writes are serialized by the GPU service's export lock. */
 struct NativeAdrenoIntegration {
-    IOReturn (*displayCall)(uint32_t, task_t, const void *, size_t, void *, size_t);
-    IOMemoryDescriptor *(*displayMemory)(void);
+    IOReturn (*displayCall)(uint32_t, task_t, const void *, const void *, size_t, void *, size_t);
+    IOMemoryDescriptor *(*displayMemory)(task_t, const void *);
     int (*exportPut)(uint32_t, uint32_t, uint32_t, const void *, uint32_t);
+    void (*displayClose)(const void *);
 };
 
 extern "C" void native_adreno_set_integration(const NativeAdrenoIntegration *);

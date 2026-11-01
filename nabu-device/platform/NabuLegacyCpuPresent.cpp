@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Narrow CPU presentation. No GPU offer, synthetic vblank or early completion.
+// Legacy presentation with an opt-in GPU blit hand-off and the verified CPU fallback.
 #include "OriginalLegacyFramebufferABI.h"
 #include "NabuLegacyCpuPixels.h"
 #include <IOKit/IOLib.h>
@@ -43,6 +43,9 @@ volatile uint64_t nabu_legacy_cpu_stored_bytes, nabu_legacy_cpu_copy_ticks;
 volatile uint64_t nabu_legacy_cpu_max_copy_ticks, nabu_legacy_cpu_diff_frames;
 volatile uint64_t nabu_legacy_cpu_shadow_bytes;
 }
+#if defined(NABU_LEGACY_GPU_SCANOUT)
+#include "NabuGpuScanoutHandoff.h"
+#endif
 
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
@@ -54,6 +57,53 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     size_t shadowBytes = 0;
     bool shadowValid = false, diffEnabled = true;
     const OriginalLegacySwapRequest *validated[64] = {};
+#if defined(NABU_LEGACY_GPU_SCANOUT)
+    NabuGpuScanoutHandoff *gpuHandoff = nullptr;
+    const OriginalLegacySwapRequest *gpuRequest = nullptr;
+    uint64_t gpuSequence = 0;
+    bool gpuBypass = false;
+
+    static void gpuCompletion(IOService *display, uint64_t sequence, IOReturn status) {
+        NativeLegacyDisplay *self = static_cast<NativeLegacyDisplay *>(display);
+        IOWorkLoop *workloop = self->getWorkLoop();
+        if (!workloop) return;
+        struct Completion { uint64_t sequence; IOReturn status; } done = {sequence, status};
+        workloop->runAction([](OSObject *target, void *argument, void *, void *, void *) -> IOReturn {
+            NativeLegacyDisplay *self = static_cast<NativeLegacyDisplay *>(target);
+            const Completion &done = *static_cast<Completion *>(argument);
+            self->gpuComplete(done.sequence, done.status);
+            return kIOReturnSuccess;
+        }, self, &done);
+    }
+#endif
+    void finishSwap(const OriginalLegacySwapRequest *request, uint64_t bytes) {
+        native_legacy_transfer_observed(kIOReturnSuccess, request, bytes);
+        if (!activateOnlyPendingSwap(request)) return;
+        nabu_legacy_request_active(this, request, 3);
+        const int slot = slotFor(request);
+        if (slot >= 0) validated[slot] = nullptr;
+        IOMobileFramebufferLegacy::completeCurrentSwap();
+        native_legacy_retirement_observed(this);
+        rekick = true;
+    }
+#if defined(NABU_LEGACY_GPU_SCANOUT)
+    void gpuComplete(uint64_t sequence, IOReturn status) {
+        if (!gpuRequest || sequence != gpuSequence) return;
+        const OriginalLegacySwapRequest *request = gpuRequest;
+        gpuRequest = nullptr; gpuSequence = 0;
+        if (!enabled || request != pendingSwapRequest()) return;
+        if (status == kIOReturnSuccess) {
+            uint32_t width = 0, height = 0;
+            getDisplayDimensions(&width, &height);
+            const bool wasKicking = kicking;
+            kicking = true; // The original completion can re-enter kickSwapQueue.
+            __asm__ volatile("dsb sy" ::: "memory");
+            finishSwap(request, uint64_t(width) * height * 4);
+            kicking = wasKicking;
+        } else gpuBypass = true;
+        kickSwapQueue();
+    }
+#endif
 
     static uint32_t word(const OriginalLegacySwapRequest *request, unsigned offset) {
         uint32_t value = 0;
@@ -95,6 +145,9 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     void kickOnce() {
         const OriginalLegacySwapRequest *request = pendingSwapRequest();
         if (!enabled || !bootMapping || !request || ml_at_interrupt_context()) return;
+#if defined(NABU_LEGACY_GPU_SCANOUT)
+        if (gpuRequest) return;
+#endif
         int acceptedSlot = slotFor(request);
         if (acceptedSlot < 0) return;
         const void *current = nullptr;
@@ -108,8 +161,18 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if (surface) {
             IOMemoryDescriptor *memory = native_legacy_surface_descriptor(surface);
             if (!memory) return;
-            source = memory->map(kIOMapAnywhere | kIOMapReadOnly);
             sourceStride = native_legacy_surface_stride(surface);
+#if defined(NABU_LEGACY_GPU_SCANOUT)
+            if (gpuHandoff && !gpuBypass && acquireConsole()) {
+                const uint64_t sequence = gpuHandoff->offer(memory, sourceStride, width, height);
+                if (sequence) {
+                    gpuRequest = request; gpuSequence = sequence;
+                    shadowValid = false;
+                    return;
+                }
+            }
+#endif
+            source = memory->map(kIOMapAnywhere | kIOMapReadOnly);
             if (!source || !source->getVirtualAddress() ||
                 source->getLength() < native_legacy_surface_allocation(surface)) {
                 OSSafeReleaseNULL(source);
@@ -150,13 +213,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         nabu_legacy_cpu_copy_ticks += ticks;
         if (ticks > nabu_legacy_cpu_max_copy_ticks) nabu_legacy_cpu_max_copy_ticks = ticks;
         if (surface) ++nabu_legacy_cpu_copied_frames; else ++nabu_legacy_cpu_blank_frames;
-        native_legacy_transfer_observed(kIOReturnSuccess, request, stored);
-        if (!activateOnlyPendingSwap(request)) return;
-        nabu_legacy_request_active(this, request, 3);
-        validated[acceptedSlot] = nullptr;
-        IOMobileFramebufferLegacy::completeCurrentSwap();
-        native_legacy_retirement_observed(this);
-        rekick = true;
+        finishSwap(request, stored);
     }
 public:
     void free() override {
@@ -166,10 +223,24 @@ public:
         IOMobileFramebufferLegacy::free();
     }
     void stop(IOService *provider) override {
+#if defined(NABU_LEGACY_GPU_SCANOUT)
+        if (gpuHandoff) {
+            getWorkLoop()->runAction([](OSObject *target, void *, void *, void *, void *) -> IOReturn {
+                NativeLegacyDisplay *self = static_cast<NativeLegacyDisplay *>(target);
+                self->enabled = false;
+                self->gpuHandoff->stop();
+                return kIOReturnSuccess;
+            }, this);
+        }
+#endif
         enabled = false;
         if (logicalPM) { PMstop(); logicalPM = false; }
         IOMobileFramebufferLegacy::stop(provider);
+#if defined(NABU_LEGACY_GPU_SCANOUT)
+        if (!gpuRequest) restoreConsole(); // Unknown DMA must not race a revived console pixel writer.
+#else
         restoreConsole();
+#endif
         releaseShadow();
         OSSafeReleaseNULL(bootMapping);
     }
@@ -202,6 +273,20 @@ public:
                 IOMobileFramebufferLegacy::stop(provider);
                 return false;
             }
+#if defined(NABU_LEGACY_GPU_SCANOUT)
+            unsigned scanout = 0;
+            PE_parse_boot_argn("nabu-gpu-scanout", &scanout, sizeof(scanout));
+            if (scanout == 1 && getWorkLoop() && !__atomic_load_n(&nabuScanoutHandoff, __ATOMIC_ACQUIRE)) {
+                uint32_t width = 0, height = 0;
+                getDisplayDimensions(&width, &height);
+                NabuGpuScanoutHandoff *handoff = new NabuGpuScanoutHandoff;
+                if (handoff && handoff->initialize(this, bootMapping, width, height, bootStride, gpuCompletion)) {
+                    gpuHandoff = handoff;
+                    __atomic_store_n(&nabuScanoutHandoff, handoff, __ATOMIC_RELEASE);
+                    IOLog("NABU DISPLAY gpu-blit handoff ready %ux%u stride=%llu\n", width, height, bootStride);
+                } else if (handoff) delete handoff;
+            }
+#endif
         }
         return true;
     }
@@ -252,13 +337,40 @@ public:
         native_legacy_registration_observed(this);
     }
     bool isMainDisplay() override { return primary; }
-    void kickSwapQueue() override {
+    void kickLocked() {
         if (kicking) { rekick = true; return; }
         kicking = true;
         do { rekick = false; kickOnce(); } while (rekick);
         kicking = false;
     }
+    void kickSwapQueue() override {
+#if defined(NABU_LEGACY_GPU_SCANOUT)
+        if (gpuHandoff) {
+            getWorkLoop()->runAction([](OSObject *target, void *, void *, void *, void *) -> IOReturn {
+                static_cast<NativeLegacyDisplay *>(target)->kickLocked();
+                return kIOReturnSuccess;
+            }, this);
+            return;
+        }
+#endif
+        kickLocked();
+    }
     bool validateSwap(const OriginalLegacySwapRequest *request) override {
+#if defined(NABU_LEGACY_GPU_SCANOUT)
+        if (gpuHandoff) {
+            struct Validation {const OriginalLegacySwapRequest *request; bool accepted;};
+            Validation validation = {request, false};
+            getWorkLoop()->runAction([](OSObject *target, void *argument, void *, void *, void *) -> IOReturn {
+                Validation &validation = *static_cast<Validation *>(argument);
+                validation.accepted = static_cast<NativeLegacyDisplay *>(target)->validateSwapLocked(validation.request);
+                return kIOReturnSuccess;
+            }, this, &validation);
+            return validation.accepted;
+        }
+#endif
+        return validateSwapLocked(request);
+    }
+    bool validateSwapLocked(const OriginalLegacySwapRequest *request) {
         bool accepted = false;
         OSObject *surface = nullptr;
         unsigned reason = 1;

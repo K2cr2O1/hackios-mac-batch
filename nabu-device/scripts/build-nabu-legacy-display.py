@@ -127,6 +127,7 @@ def main():
     abi.mkdir(parents=True, exist_ok=True)
     discovery = os.environ.get('NABU_LEGACY_DISCOVERY_ONLY') == '1'
     cpu = os.environ.get('NABU_LEGACY_CPU_PRESENT') == '1'
+    scanout = cpu and profile == 'nabu_ufs_gpu_metal_defconfig'
     notification_scope = None
     if discovery and cpu:
         raise SystemExit('Discovery and CPU presentation modes are mutually exclusive')
@@ -135,6 +136,9 @@ def main():
     elif cpu:
         shutil.copy2(device / 'platform/NabuLegacyCpuPresent.cpp', source / 'NativeLegacyDisplay.cpp')
         shutil.copy2(device / 'platform/NabuLegacyCpuPixels.h', source / 'NabuLegacyCpuPixels.h')
+        if scanout:
+            for name in ('NabuGpuScanoutHandoff.h', 'NabuGpuScanoutWire.h'):
+                shutil.copy2(device / 'platform' / name, source / name)
         shutil.copy2(device / 'platform/NabuKeybagNotifications.cpp', source / 'NabuKeybagNotifications.cpp')
         try:
             notification_scope = validate_cpu_profile(
@@ -170,6 +174,8 @@ def main():
             raise SystemExit('CPU presentation requires the original limited ABI contract')
         includes += ['-DNABU_LEGACY_CPU_PRESENT=1', '-DNABU_LEGACY_CPU_ABI_VERIFIED=1',
                      '-DNABU_KEYBAG_RAM_DATA_VERIFIED=1']
+    if scanout:
+        includes.append('-DNABU_LEGACY_GPU_SCANOUT=1')
     objects = []
     sources = ['NativeLegacyDisplay.cpp', 'NabuLegacyDisplayProbe.cpp',
                'NabuLegacyStubs.cpp', 'NabuGraphicsStatus.cpp']
@@ -255,6 +261,7 @@ def main():
         'reference_candidate_sha256': sha(reference),
         'discovery_only': discovery,
         'cpu_present': cpu,
+        'gpu_scanout_handoff_compiled': scanout,
         'ephemeral_notification_transport_compiled': cpu,
         'notification_profile_qualification': notification_scope,
         'key_state_queries_supported': False,

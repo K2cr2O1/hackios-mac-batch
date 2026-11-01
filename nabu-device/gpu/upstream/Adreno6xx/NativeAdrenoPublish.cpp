@@ -21,6 +21,7 @@
 #include <IOKit/IOBSD.h>
 #include <string.h>
 #include <kern/thread.h>
+#include <kern/task.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
 #include <mach/kmod.h>
@@ -1026,6 +1027,7 @@ IOReturn AGXDeviceUserClient::clientClose()
     AGXDeviceUserClient *mailbox=nullptr;
     if(gMailboxOwner==this) {mailbox=gMailboxOwner;gMailboxOwner=nullptr;}
     IOLockUnlock(g.lock);
+    if(handoffOnly_ && integration.displayClose)integration.displayClose(this);
 
     IOLockLock(legacyCpuLock_);
     IOReturn status=dropCpuMappings();
@@ -1086,6 +1088,7 @@ void AGXDeviceUserClient::free()
         IOLockFree(legacyCpuLock_);
         legacyCpuLock_=nullptr;
     }
+    if(handoffOnly_ && integration.displayClose)integration.displayClose(this);
     IOUserClient::free();
 }
 IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *options,IOMemoryDescriptor **memory)
@@ -1094,12 +1097,12 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
     if(!memory || !options)return kIOReturnBadArgument;
     IOLockLock(g.lock);
     const bool ready=!closing_ && !viewTeardownStatus_;
-    const bool scanoutReady=ready && (live_ || handoffOnly_);
+    const bool scanoutReady=ready && handoffOnly_;
     IOLockUnlock(g.lock);
     if(!ready)return kIOReturnNotReady;
     if(type==NativeAdrenoScanoutType) {
         if(!scanoutReady)return kIOReturnNotReady;
-        IOMemoryDescriptor *scanout=integration.displayMemory?integration.displayMemory():nullptr;
+        IOMemoryDescriptor *scanout=integration.displayMemory?integration.displayMemory(current_task(),this):nullptr;
         if(!scanout)return kIOReturnNotReady;
         *memory=scanout;                        /* already retained for the caller */
         *options=kIOMapAnywhere|kIOMapInhibitCache;   /* firmware framebuffer: device memory, never cached by the CPU */
@@ -1397,8 +1400,9 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
         return status;
     }
     if(method>=NativeAdrenoHandoffBase && method<=NativeAdrenoHandoffLast) {
+        if(!handoffOnly_)return kIOReturnUnsupported;
         return integration.displayCall?
-            integration.displayCall(method-NativeAdrenoHandoffBase,current_task(),input,input_size,output,output_size):
+            integration.displayCall(method-NativeAdrenoHandoffBase,current_task(),this,input,input_size,output,output_size):
             kIOReturnUnsupported;
     }
     if(method==NativeAdrenoExportMethod) {

@@ -129,6 +129,13 @@ def qualify_display_candidate(upstream, device, candidate, expected_profile=None
         raise ValueError('Display archive did not compile the selected implementation')
     if cpu and sha(out / 'source/NabuLegacyCpuPixels.h') != sha(device / 'platform/NabuLegacyCpuPixels.h'):
         raise ValueError('CPU pixel implementation changed')
+    scanout = report.get('gpu_scanout_handoff_compiled') is True
+    if 'gpu_scanout_handoff_compiled' in report and scanout != (cpu and profile == HARDWARE_GPU_METAL_PROFILE):
+        raise ValueError('GPU scanout hand-off compiled in the wrong profile')
+    if scanout:
+        for name in ('NabuGpuScanoutHandoff.h', 'NabuGpuScanoutWire.h'):
+            if sha(out / 'source' / name) != sha(device / 'platform' / name):
+                raise ValueError('GPU scanout hand-off input changed: ' + name)
     if cpu and sha(out / 'source/NabuKeybagNotifications.cpp') != sha(device / 'platform/NabuKeybagNotifications.cpp'):
         raise ValueError('Ephemeral notification implementation changed')
     if cpu and (report.get('key_state_queries_supported') is not False or
@@ -145,6 +152,8 @@ def qualify_display_candidate(upstream, device, candidate, expected_profile=None
         forbidden = '-DNABU_LEGACY_DISCOVERY_ONLY=1' if cpu else '-DNABU_LEGACY_CPU_PRESENT=1'
         if any(flag not in command for flag in required) or forbidden in command:
             raise ValueError('Display object has the wrong implementation compile flags')
+        if ('-DNABU_LEGACY_GPU_SCANOUT=1' in command) != scanout:
+            raise ValueError('Display object has the wrong scanout compile flag')
     for name, digest in report['source_sha256'].items():
         if not (tree / name).resolve().is_relative_to(tree.resolve()) or sha(tree / name) != digest:
             raise ValueError('Display source mismatch')
@@ -165,6 +174,10 @@ def qualify_display_candidate(upstream, device, candidate, expected_profile=None
         raise ValueError('Final CPU limited ABI contract changed')
     raw = candidate.read_bytes()
     symbols, segments = symbols_and_segments(raw)
+    if scanout:
+        for name in ('_nabu_gpu_scanout_display_call', '_nabu_gpu_scanout_display_memory', '_nabu_gpu_scanout_display_close'):
+            if name not in symbols:
+                raise ValueError('Final kernel lacks GPU scanout callback: ' + name)
     aliases = re.findall(r'^\.set (\S+), (0x[0-9a-f]+)$',
                          (out / 'original-legacy-bindings-all.S').read_text(), re.M)
     for name, address in aliases:
@@ -182,6 +195,9 @@ def qualify_display_candidate(upstream, device, candidate, expected_profile=None
             'archive_sha256': report['archive_sha256'], 'aliases_verified': len(aliases),
             'vtable_slots_verified': 358, 'candidate_sha256': sha(candidate),
             'pixel_transfer_enabled': cpu, 'pixel_transfer_runtime_observed': False,
+            **({'gpu_scanout_handoff': {'trigger': 'nabu-gpu-scanout=1', 'wire_version': 1,
+                'wire_sha256': sha(out / 'source/NabuGpuScanoutWire.h'),
+                'zero_copy': True, 'hardware_tested': False}} if scanout else {}),
             'user_client_interposition': False,
             'ephemeral_notification_transport_compiled': cpu,
             'notification_profile_qualification': report.get('notification_profile_qualification'),

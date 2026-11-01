@@ -21,11 +21,12 @@ SUBMODULES = {
 }
 METAL2VULKAN = 'https://github.com/steelbrain/metal2vulkan.git'
 RUST = '1.98.0'
-# A640: no NativeMobileDisplay GOP wire, 21H16 is not the A740 OS image, and the recorded replay is A740-only.
-BOARD_ARGUMENTS = ('--scanout-copy', 'off', '--quartzcore-display-state', 'off', '--turnip-replay', 'off')
+# Nabu supplies the GOP wire; its scanout backend is opt-in at boot. QuartzCore addresses and replay remain A740-only.
+BOARD_ARGUMENTS = ('--scanout-copy', 'on', '--quartzcore-display-state', 'off', '--turnip-replay', 'off')
 # Built by build-adreno-metal-plugin.py but not deployed on nabu; listed in the report only.
 # nabu patches to the pinned AdrenoMetal checkout (paths relative to the device tree), applied in order.
-ADRENOMETAL_PATCHES = ('patches/adrenometal-shader-cache-optional.patch', 'patches/adrenometal-quartzcore-failures.patch')
+ADRENOMETAL_PATCHES = ('patches/adrenometal-shader-cache-optional.patch', 'patches/adrenometal-quartzcore-failures.patch',
+                       'patches/adrenometal-nabu-scanout.patch')
 UNDEPLOYED = ('adrenoprobed', 'adrenoprobed-entitlements.plist', 'org.blu-sharky.adrenoprobed.plist',
               'com.apple.iomfb_fdr_loader.plist', 'com.apple.bluetoothd.plist')
 
@@ -66,6 +67,7 @@ def prepare(root, device):
     for patch in ADRENOMETAL_PATCHES:
         run(['git', '-C', metal, 'apply', '--check', device / patch])
         run(['git', '-C', metal, 'apply', device / patch])
+    shutil.copyfile(device / 'platform/NabuGpuScanoutWire.h', metal / 'NabuGpuScanoutWire.h')
     pins = json.loads((root / 'scripts/data/gpu-metal-vulkan-inputs.json').read_text())
     translator = pins['translator']['commit']
     if pins['translator']['repository'].rstrip('/') + '.git' != METAL2VULKAN:
@@ -97,6 +99,7 @@ def build(root, device, output, env):
               'abi_header_sha256': sha(abi / 'NativeAdrenoABI.h'), 'gpu_exercised': False, 'runtime_qualified': False}
     report['metal2vulkan_commit'] = prepare(root, device)
     report['adrenometal_patches'] = {patch: sha(device / patch) for patch in ADRENOMETAL_PATCHES}
+    report['scanout_wire_sha256'] = sha(device / 'platform/NabuGpuScanoutWire.h')
     report['rust_version'] = read(['rustc', '+' + RUST, '--version'])
     compiler = shutil.which('glslangValidator', path=env['PATH'])
     if not compiler:

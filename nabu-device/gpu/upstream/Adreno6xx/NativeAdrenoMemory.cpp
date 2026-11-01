@@ -1,10 +1,14 @@
 /* SPDX-License-Identifier: MIT */
 #include "NativeAdrenoMemory.h"
+#include "NabuGpuCopyPlan.h"
 /* Where a call that never returns is stuck: the free/unmap/release path stores a stage number here, the board page shows it. */
 extern "C" {volatile uint32_t native_adreno_trace_stage;}
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <kern/task.h>
+#include <pexpert/pexpert.h>
+
+extern "C" uint64_t gPhysBase,gPhysSize;
 
 /* The board diagnostic layout keeps allocation, prepare, spans, zero, four
  * reserved rows, complete and descriptor release. Each row records calls,
@@ -631,6 +635,36 @@ static IOMemoryDescriptor *importRange(uint64_t address,size_t bytes,IODirection
     if(range)native_adreno_import_persistent[1]=native_adreno_import_persistent[1]+1;
     return range;
 }
+/* Only the complete current GOP allocation is a firmware import. Its CPU
+ * mapping stays Device/uncached; do not reclassify arbitrary non-DRAM pages or
+ * change their pmap attributes. The importing descriptor remains prepared and
+ * owned by importTask until the normal GPU-unmap/release path completes. */
+static uint64_t firmwareImportPhysical(IOMemoryDescriptor *memory,size_t bytes,unsigned bits,bool read_only)
+{
+    int scanout=0;
+    PE_parse_boot_argn("nabu-gpu-scanout",&scanout,sizeof(scanout));
+    PE_Video video{};
+    if(scanout!=1 || read_only || PE_current_console(&video) || video.v_depth!=32 || video.v_rotate ||
+        !video.v_width || !video.v_height || video.v_width>16384 || video.v_height>16384 ||
+        video.v_rowBytes>UINT64_MAX/video.v_height) {
+        return 0;
+    }
+    const uint64_t extent=uint64_t(video.v_rowBytes)*video.v_height;
+    if(extent!=bytes || memory->getLength()!=extent ||
+        !nabu_gpu_copy_rows(static_cast<uint32_t>(video.v_width),static_cast<uint32_t>(video.v_height),
+            video.v_rowBytes,extent) ||
+        !nabu_gpu_firmware_range(video.v_baseAddr,extent,gPhysBase,gPhysSize,bits)) {
+        return 0;
+    }
+    for(size_t offset=0;offset<bytes;offset+=4096) {
+        IOByteCount length=0;
+        const addr64_t physical=memory->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
+        if(physical!=video.v_baseAddr+offset || length<4096) {
+            return 0;
+        }
+    }
+    return video.v_baseAddr;
+}
 IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes,unsigned bits,size_t budget)
 {
     native_adreno_import_stage=10;
@@ -649,6 +683,7 @@ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes
     native_adreno_import_stage=13;
     IOReturn status=NativeAdrenoQueryCpu4K(&cpu);if(status!=kIOReturnSuccess)return status;
     const uint64_t limit=UINT64_C(1)<<bits;
+    uint64_t firmware_physical=0;
     imported_=importRange(address,bytes,kIODirectionInOut,task);
     native_adreno_import_stage=14;
     if(!imported_)return kIOReturnNoMemory;
@@ -670,13 +705,18 @@ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes
     native_adreno_import_stage=16;
     if(imported_->getLength()!=bytes)goto failed;
     native_adreno_import_stage=17;
-    storage_.span_capacity=bytes/4096;
+    firmware_physical=firmwareImportPhysical(imported_,bytes,bits,read_only_);
+    storage_.span_capacity=firmware_physical?1:bytes/4096;
     storage_.spans=IONewData(NativeAdrenoPhysicalSpan,storage_.span_capacity);
     if(!storage_.spans) {
         status=kIOReturnNoMemory;
         goto failed;
     }
-    for(size_t offset=0;offset<bytes;offset+=4096) {
+    if(firmware_physical) {
+        storage_.spans[0]={0,firmware_physical,bytes,0};
+        storage_.span_count=1;
+        cpu_cache_mode_=NativeAdrenoCpuCacheMode::FirmwareUncached;
+    } else for(size_t offset=0;offset<bytes;offset+=4096) {
         IOByteCount length=0;
         addr64_t physical=imported_->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
         if(!physical || (physical&4095) || length<4096 || physical>=limit || 4096>limit-physical)
