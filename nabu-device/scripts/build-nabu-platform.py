@@ -83,6 +83,10 @@ def main():
     if result.returncode:
         raise SystemExit(result.stderr.decode('utf-8', errors='replace')[-4000:])
     check_object(obj.read_bytes())
+    ipi_instructions = None
+    if args.component == 'ArmCpu':
+        from nabu_armcpu_source import check_ipi_object
+        ipi_instructions = check_ipi_object(obj)
     objects = [obj]
     stubs = out / 'PmgrPublishStubs.cpp'
     stubs.write_text(
@@ -246,7 +250,7 @@ def main():
         'boot_pmgr': boot_pmgr,
         'watchdog': watchdog,
         'touch': touch,
-        'timer_binding': timer_binding,
+        'timer_binding': timer_binding, 'ipi_instructions': ipi_instructions,
         'usb_probe': usb_probe,
         'usb_cdc': usb_cdc,
         'heartbeat': heartbeat,

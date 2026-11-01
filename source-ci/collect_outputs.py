@@ -112,6 +112,8 @@ def selected_files(upstream):
                     'namespace.h', 'inputs.S', 'NativeVirtioBlock.cpp', 'ArmDTPlatform.cpp',
                     'OriginalPMGRABI.h', 'original-bindings.S'):
                 add(path, path.relative_to(work))
+            elif relative == 'armcpu' and path.name in ('ArmCpu.cpp', 'ArmCpu.o', 'compile.log'):
+                add(path, path.relative_to(work))
             elif relative == 'armdt-platform' and path.name in (
                     'NabuUsbProbe.cpp', 'NabuUsbProbe.o', 'NabuUsbProbe.o.json',
                     'NabuUsbCaptureCdc.o', 'usb-cdc-compile.log', 'usb-probe-compile.log'):
