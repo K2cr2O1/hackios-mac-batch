@@ -69,14 +69,22 @@ def qualify(read, candidate):
     capture = json_object(read('outputs/tree/build/nabu-log/source-report.json'))
     exec_path = 'outputs/tree/.cache/xnu-work/bsd/kern/kern_exec.c'
     exit_path = 'outputs/tree/.cache/xnu-work/bsd/kern/kern_exit.c'
+    thread_path = 'outputs/tree/.cache/xnu-work/osfmk/kern/thread.c'
     exec_source, exit_source = read(exec_path), read(exit_path)
     enabled = capture.get('ui_watch', False)
     require(type(enabled) is bool, 'UI watch build flag must be Boolean')
     if not enabled:
+        try:
+            thread_source = read(thread_path)
+        except KeyError:
+            # Evidence from a build that predates the osfmk sampler has no such hook.
+            thread_source = b''
         require(b'NABU_UI_WATCH' not in exec_source and b'NABU_UI_WATCH' not in exit_source and
+                b'NABU_UI_WATCH' not in thread_source and
                 b'nabu-ui-watch' not in candidate and b'_nabu_ui_watch_' not in candidate,
                 'Disabled kernel retains UI observer definitions or dependencies')
         return {'compiled': False, 'runtime_qualified': False}
+    thread_source = read(thread_path)
     require(capture.get('gpu_userprobe_boot') is True, 'UI observer needs the original callback')
     generator = read('device/scripts/nabu_ui_watch_source.py')
     require(capture.get('ui_watch_generator_sha256') == sha(generator),
@@ -84,32 +92,46 @@ def qualify(read, candidate):
     constants = {}
     for item in ast.parse(generator.decode('utf-8')).body:
         if isinstance(item, ast.Assign) and len(item.targets) == 1 and isinstance(item.targets[0], ast.Name):
-            if item.targets[0].id in ('CONTRACT', 'EXEC_HELPER', 'EXEC_PAIRS', 'EXIT_PAIRS'):
+            if item.targets[0].id in ('CONTRACT', 'EXEC_HELPER', 'EXEC_PAIRS', 'EXIT_PAIRS',
+                                      'THREAD_HELPER', 'THREAD_PAIRS'):
                 constants[item.targets[0].id] = ast.literal_eval(item.value)
-    require(set(constants) == {'CONTRACT', 'EXEC_HELPER', 'EXEC_PAIRS', 'EXIT_PAIRS'},
-            'UI source contract incomplete')
+    require(set(constants) == {'CONTRACT', 'EXEC_HELPER', 'EXEC_PAIRS', 'EXIT_PAIRS',
+                               'THREAD_HELPER', 'THREAD_PAIRS'}, 'UI source contract incomplete')
     contract = constants['CONTRACT']
     require(contract.get('max_samples') == 64 and contract.get('interval_us') == 10000000 and
             contract.get('max_threads') == 3 and contract.get('targets') ==
             ['SpringBoard', 'backboardd', 'runningboardd'], 'UI scope or budget changed')
     require(exec_source.count(constants['EXEC_HELPER'].encode()) == 1 and
             all(exec_source.count(after.encode()) == 1 for _, after in constants['EXEC_PAIRS']) and
-            all(exit_source.count(after.encode()) == 1 for _, after in constants['EXIT_PAIRS']),
+            all(exit_source.count(after.encode()) == 1 for _, after in constants['EXIT_PAIRS']) and
+            thread_source.count(constants['THREAD_HELPER'].encode()) == 1 and
+            all(thread_source.count(after.encode()) == 1 for _, after in constants['THREAD_PAIRS']),
             'Actual XNU sources lack the exact UI hooks')
     require(capture.get('hooks', {}).get('bsd/kern/kern_exec.c') == sha(exec_source) and
-            capture.get('hooks', {}).get('bsd/kern/kern_exit.c') == sha(exit_source),
+            capture.get('hooks', {}).get('bsd/kern/kern_exit.c') == sha(exit_source) and
+            capture.get('hooks', {}).get('osfmk/kern/thread.c') == sha(thread_source),
             'UI XNU sources differ from the capture report')
     symbols = contract.get('symbols')
     require(isinstance(symbols, list) and symbols and len(set(symbols)) == len(symbols) and
             all(name.startswith('_nabu_ui_watch_') for name in symbols),
             'UI exported symbol contract malformed')
-    object_path = ('outputs/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/'
-                   'bsd/DEVELOPMENT/kern_exec.o')
-    obj = read(object_path)
-    require(set(symbols) <= set(object_symbols(obj)), 'Actual XNU object lacks UI emitted entries')
+    mapping = contract.get('symbols_by_object')
+    require(isinstance(mapping, dict) and set(mapping) == {'kern_exec.c', 'thread.c'} and
+            sorted(sum(mapping.values(), [])) == sorted(symbols), 'UI per-object symbol map malformed')
+    objects = {}
+    for name, wanted in mapping.items():
+        relative = ('osfmk/DEVELOPMENT/thread.o' if name == 'thread.c'
+                    else 'bsd/DEVELOPMENT/kern_exec.o')
+        object_path = ('outputs/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/' + relative)
+        obj = read(object_path)
+        actual = object_symbols(obj)
+        require(set(wanted) <= set(actual), 'Actual XNU object lacks UI emitted entries: ' + name)
+        objects[name] = {'path': object_path, 'sha256': sha(obj),
+                         'definitions': {symbol: actual[symbol] for symbol in wanted}}
     final, _ = candidate_definitions(candidate, METAL_PROFILE, symbols)
     return {'compiled': True, 'trigger': 'nabu-ui-watch=1', 'contract': contract,
             'generator_sha256': sha(generator), 'exec_source_sha256': sha(exec_source),
-            'exit_source_sha256': sha(exit_source), 'object': object_path, 'object_sha256': sha(obj),
+            'exit_source_sha256': sha(exit_source), 'thread_source_sha256': sha(thread_source),
+            'objects': objects,
             'final_definitions': {name: final[name] for name in symbols},
             'first_incarnation_only': True, 'runtime_qualified': False, 'hardware_tested': False}

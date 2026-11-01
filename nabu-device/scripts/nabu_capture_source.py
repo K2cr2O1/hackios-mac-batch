@@ -18,13 +18,15 @@ def gpu_userprobe_data_source(text, restore=False, exit_observer=False):
     return module.exit_source(text, restore=restore) if exit_observer else module.data_source(text, restore=restore)
 
 
-def ui_watch_source(text, restore=False, exit_observer=False):
+def ui_watch_source(text, restore=False, exit_observer=False, thread_observer=False):
     # Only enabled builds or explicit restoration load this optional module.
     import importlib.util
     spec = importlib.util.spec_from_file_location('nabu_ui_watch_source',
         Path(__file__).with_name('nabu_ui_watch_source.py'))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    if thread_observer:
+        return module.thread_source(text, restore=restore)
     transform = module.exit_source if exit_observer else module.exec_source
     return transform(text, restore=restore)
 
@@ -373,19 +375,23 @@ def apply(root, device):
             ('bsd/kern/bsd_init.c', [patch_bsd_init, patch_bsd_init_cdc]),
             ('bsd/kern/kern_exec.c', [patch_data_mount]),
             ('bsd/kern/kern_exit.c', [patch_exit_trace, patch_exit_panic_state]),
-            ('osfmk/kern/exception.c', [patch_user_exception])]:
+            ('osfmk/kern/exception.c', [patch_user_exception]),
+            ('osfmk/kern/thread.c', [])]:
         path = xnu / relative
         result = path.read_text(encoding='utf-8')
-        if relative in ('bsd/kern/kern_exec.c', 'bsd/kern/kern_exit.c') and 'NABU_UI_WATCH' in result:
-            result = ui_watch_source(result, restore=True, exit_observer=relative.endswith('kern_exit.c'))
+        ui_file = relative in ('bsd/kern/kern_exec.c', 'bsd/kern/kern_exit.c', 'osfmk/kern/thread.c')
+        if ui_file and 'NABU_UI_WATCH' in result:
+            result = ui_watch_source(result, restore=True, exit_observer=relative.endswith('kern_exit.c'),
+                                     thread_observer=relative.endswith('kern/thread.c'))
         for transform in transforms:
             result = transform(result)
         if relative == 'bsd/kern/kern_exec.c' and os.environ.get('NABU_GPU_USERPROBE') == '1':
             result = gpu_userprobe_data_source(result)
         if relative == 'bsd/kern/kern_exit.c' and os.environ.get('NABU_GPU_USERPROBE') == '1':
             result = gpu_userprobe_data_source(result, exit_observer=True)
-        if ui_watch and relative in ('bsd/kern/kern_exec.c', 'bsd/kern/kern_exit.c'):
-            result = ui_watch_source(result, exit_observer=relative.endswith('kern_exit.c'))
+        if ui_watch and ui_file:
+            result = ui_watch_source(result, exit_observer=relative.endswith('kern_exit.c'),
+                                     thread_observer=relative.endswith('kern/thread.c'))
         path.write_text(result, encoding='utf-8')
         changed[relative] = hashlib.sha256(result.encode()).hexdigest()
     for name in ('NabuLogCore.h', 'NabuLogFormat.h'):
@@ -435,6 +441,13 @@ if __name__ == '__main__':
                 after = gpu_userprobe_data_source(after, restore=True)
             if before != after:
                 path.write_text(after, encoding='utf-8')
+        thread_path = a.root / '.cache/xnu-work/osfmk/kern/thread.c'
+        if thread_path.exists():
+            before = thread_path.read_text(encoding='utf-8')
+            if 'NABU_UI_WATCH' in before:
+                after = ui_watch_source(before, restore=True, thread_observer=True)
+                if before != after:
+                    thread_path.write_text(after, encoding='utf-8')
         exit_path = a.root / '.cache/xnu-work/bsd/kern/kern_exit.c'
         if exit_path.exists():
             before = exit_path.read_text(encoding='utf-8')

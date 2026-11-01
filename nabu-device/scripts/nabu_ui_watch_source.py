@@ -8,7 +8,15 @@ CONTRACT = {
     'symbols': ['_nabu_ui_watch_snapshot', '_nabu_ui_watch_exit_note',
                 '_nabu_ui_watch_activation', '_nabu_ui_watch_signature',
                 '_nabu_ui_watch_release_ready', '_nabu_ui_watch_released',
-                '_nabu_ui_watch_activate_image'],
+                '_nabu_ui_watch_activate_image', '_nabu_ui_watch_thread_state'],
+    'symbols_by_object': {
+        'kern_exec.c': ['_nabu_ui_watch_snapshot', '_nabu_ui_watch_exit_note',
+                        '_nabu_ui_watch_activation', '_nabu_ui_watch_signature',
+                        '_nabu_ui_watch_release_ready', '_nabu_ui_watch_released',
+                        '_nabu_ui_watch_activate_image'],
+        'thread.c': ['_nabu_ui_watch_thread_state'],
+    },
+    'symbol_references_by_object': {'kern_exit.c': ['_nabu_ui_watch_exit_note']},
     'max_samples': 64, 'interval_us': 10000000, 'max_threads': 3,
     'max_events': 96, 'max_exec_contexts': 16, 'max_line_bytes': 256, 'first_incarnation_only': True,
     'user_memory_read': False, 'scheduler_changed': False, 'new_worker': False,
@@ -17,12 +25,12 @@ CONTRACT = {
 PREFIX = '#define nabu_gpu_userprobe_exec_snapshot nabu_ui_watch_snapshot\n'
 SUFFIX = '#undef nabu_gpu_userprobe_exec_snapshot\n'
 
-EXEC_HELPER = r'''/* NABU_UI_WATCH_V1: bounded observation, no exec/scheduler policy change. */
-#ifndef NABU_UI_WATCH_TEST
-#include <kern/thread.h>
-#include <kern/clock.h>
-#include <kern/sched_prim.h>
-#endif
+EXEC_HELPER = r'''/* NABU_UI_WATCH_V1: bounded observation, no exec/scheduler policy change.
+ * This is a BSD unit: struct thread and sched locks are not visible here. The
+ * scheduler fields are read by nabu_ui_watch_thread_state in osfmk/kern/thread.c. */
+extern int nabu_ui_watch_thread_state(thread_t, uint32_t *, uint32_t *, uint64_t *);
+/* XNU thread state bits; thread.h's definitions are private to osfmk. */
+enum { NABU_UI_TH_TERMINATE = 0x10, NABU_UI_TH_TERMINATE2 = 0x20 };
 
 enum { NABU_UI_TARGETS = 3, NABU_UI_MAX_EVENTS = 96, NABU_UI_MAX_SAMPLES = 64 };
 enum { NABU_UI_EMPTY = 0, NABU_UI_CLAIMING = 1, NABU_UI_READY = 2, NABU_UI_CLOSED = 3 };
@@ -319,27 +327,13 @@ nabu_ui_watch_snapshot(uint32_t out[6])
                     "not_observed" : "not_published", phase));
             continue;
         }
-        thread_t thread = slot->thread;
+        thread_t thread = __atomic_load_n(&slot->thread, __ATOMIC_ACQUIRE);
         uint32_t state = 0, hint = 0;
         uint64_t wait = 0;
         const char *status = "sample_unavailable";
         if (thread) {
-            spl_t s = splsched();
-            if (simple_lock_try(&thread->sched_lock, &thread_lck_grp)) {
-                state = (uint32_t)thread->state;
-                hint = (uint32_t)thread->block_hint;
-                /* An association tag only; no event pointer escapes. */
-                uint64_t event = (uint64_t)thread->wait_event;
-                if (event) {
-                    uint64_t tag = event ^ slot->uniqueid;
-                    tag = (tag ^ (tag >> 30)) * 0xbf58476d1ce4e5b9ULL;
-                    tag = (tag ^ (tag >> 27)) * 0x94d049bb133111ebULL;
-                    wait = (tag ^ (tag >> 31)) & 0xffffffff;
-                }
-                thread_unlock(thread);
-                status = "sample_ok";
-            } else status = "lock_busy";
-            splx(s);
+            int sampled = nabu_ui_watch_thread_state(thread, &state, &hint, &wait);
+            status = sampled == 0 ? "sample_ok" : sampled == 1 ? "lock_busy" : "sample_unavailable";
         }
         unsigned exited = __atomic_load_n(&slot->exit_observed, __ATOMIC_ACQUIRE);
         unsigned instances = __atomic_load_n(&slot->instances, __ATOMIC_RELAXED);
@@ -348,7 +342,8 @@ nabu_ui_watch_snapshot(uint32_t out[6])
             "NabuUI: sample=%u target=%s pid=%d uid=%llu tid=%llu status=%s state=%x hint=%u wait_tag=%llx exit=%u stale=%u instances=%u first_incarnation=1\n",
             sample, nabu_ui_names[i], slot->pid, (unsigned long long)slot->uniqueid,
             (unsigned long long)slot->tid, status, state, hint, (unsigned long long)wait,
-            exited, exited || latest_tid != slot->tid || (state & (TH_TERMINATE | TH_TERMINATE2)), instances));
+            exited, exited || latest_tid != slot->tid ||
+            (state & (NABU_UI_TH_TERMINATE | NABU_UI_TH_TERMINATE2)), instances));
     }
     nabu_ui_emit(line, snprintf(line, sizeof(line),
         "NabuUI: budget sample=%u us=%llu events=%u pending=%u dropped=%u texts_dropped=%u contexts_dropped=%u sample_contended=%u closing=%u snapshot=non-atomic\n",
@@ -658,3 +653,84 @@ EXIT_PAIRS = (
 	nabu_ui_watch_exit_note(p, rv);
 '''),
 )
+
+THREAD_HELPER = r'''/* NABU_UI_WATCH_THREAD_V1: scheduler fields stay in this private osfmk unit. */
+int
+nabu_ui_watch_thread_state(thread_t thread, uint32_t *state, uint32_t *hint, uint64_t *wait_tag)
+{
+	if (thread == THREAD_NULL || state == NULL || hint == NULL || wait_tag == NULL) return 2;
+	uint64_t event = 0, tag = 0;
+	spl_t s = splsched();
+	if (!simple_lock_try(&thread->sched_lock, &thread_lck_grp)) {
+		splx(s);
+		return 1;
+	}
+	*state = (uint32_t)thread->state;
+	*hint = (uint32_t)thread->block_hint;
+	event = (uint64_t)thread->wait_event;
+	thread_unlock(thread);
+	splx(s);
+	if (event) {
+		tag = event ^ thread_tid(thread);
+		tag = (tag ^ (tag >> 30)) * 0xbf58476d1ce4e5b9ULL;
+		tag = (tag ^ (tag >> 27)) * 0x94d049bb133111ebULL;
+		tag = (tag ^ (tag >> 31)) & 0xffffffff;
+	}
+	*wait_tag = tag;
+	return 0;
+}
+'''
+
+THREAD_PAIRS = (
+    (r'''/* Drop a thread refcount safely without triggering a zfree */
+void
+thread_deallocate_safe(thread_t thread)
+{
+''',
+     r'''/* NABU_UI_WATCH_THREAD_V1: scheduler fields stay in this private osfmk unit. */
+int
+nabu_ui_watch_thread_state(thread_t thread, uint32_t *state, uint32_t *hint, uint64_t *wait_tag)
+{
+	if (thread == THREAD_NULL || state == NULL || hint == NULL || wait_tag == NULL) return 2;
+	uint64_t event = 0, tag = 0;
+	spl_t s = splsched();
+	if (!simple_lock_try(&thread->sched_lock, &thread_lck_grp)) {
+		splx(s);
+		return 1;
+	}
+	*state = (uint32_t)thread->state;
+	*hint = (uint32_t)thread->block_hint;
+	event = (uint64_t)thread->wait_event;
+	thread_unlock(thread);
+	splx(s);
+	if (event) {
+		tag = event ^ thread_tid(thread);
+		tag = (tag ^ (tag >> 30)) * 0xbf58476d1ce4e5b9ULL;
+		tag = (tag ^ (tag >> 27)) * 0x94d049bb133111ebULL;
+		tag = (tag ^ (tag >> 31)) & 0xffffffff;
+	}
+	*wait_tag = tag;
+	return 0;
+}
+/* Drop a thread refcount safely without triggering a zfree */
+void
+thread_deallocate_safe(thread_t thread)
+{
+'''),
+)
+
+
+def thread_source(text, restore=False):
+    marker = '/* NABU_UI_WATCH_THREAD_V1:'
+    if marker in text:
+        if text.count(THREAD_HELPER) != 1 or any(text.count(after) != 1 for _, after in THREAD_PAIRS):
+            raise ValueError('UI watch thread source changed after patching')
+        if restore:
+            for before, after in reversed(THREAD_PAIRS):
+                text = _once(text, after, before)
+        return text
+    if restore:
+        return text
+    for before, after in THREAD_PAIRS:
+        text = _once(text, before, after)
+    return text

@@ -66,6 +66,7 @@ def selected_files(upstream):
                           'serial_console.o', 'serial_console.o.json', 'serial_general.o', 'serial_general.o.json',
                           'pe_kprintf.o', 'pe_kprintf.o.json', 'bsd_init.o', 'bsd_init.o.json',
                           'kern_exec.o', 'kern_exec.o.json', 'kern_exit.o', 'kern_exit.o.json',
+                          'thread.o', 'thread.o.json',
                           'ubc_subr.o', 'ubc_subr.o.json',
                           'exception.o', 'exception.o.json'}
     report_names = {'report.json', 'bindings.json', 'candidate-bindings.json', 'nabu-ufs-source.json', 'readonly-source.json',
@@ -159,7 +160,8 @@ def selected_files(upstream):
                      'tree/.cache/xnu-work/bsd/kern/kern_exec.c',
                      'tree/.cache/xnu-work/bsd/kern/ubc_subr.c',
                      'tree/.cache/xnu-work/bsd/kern/kern_exit.c',
-                     'tree/.cache/xnu-work/osfmk/kern/exception.c'):
+                     'tree/.cache/xnu-work/osfmk/kern/exception.c',
+                     'tree/.cache/xnu-work/osfmk/kern/thread.c'):
         add(work / relative, Path(relative))
     # The assembled tree exposes patches through a symlink. Collect the
     # authenticated upstream file itself, never the link target discovered by
