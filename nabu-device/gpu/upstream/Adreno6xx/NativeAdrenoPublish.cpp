@@ -31,6 +31,7 @@
 #include "NativeAdrenoA6xxService.h"
 #include "NativeAdrenoDisplay.h"
 #include "NativeAdrenoScheduler.h"
+#include "NabuGpuProblemLog.h"
 
 static NativeAdrenoIntegration integration = {};
 extern "C" kmod_info_t g_kernel_kmod_info;
@@ -1624,6 +1625,10 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
      * that a sandbox that admits neither selectors nor mapping, or a crash, still leaves a trace of how far it got. */
     if((type>>16)==NativeAdrenoPluginOpenType && (type&0xffff)) {
         const uint32_t value=type&0xffff,slot=native_adreno_metal_diag.marks_total&15;
+        if((value&0xff00)==0x6d00) {
+            nabu_gpu_problem_log_marker(value);
+            return kIOReturnUnsupported;
+        }
         /* Text stream into report2, one character per marker: 0x7fff starts a line, 0x70cc appends character cc. It needs no connection,
          * so the plugin's Turnip watchdog can report while Turnip itself holds its connection slot. Not counted as markers. */
         if(value>=0x8000) {
@@ -1847,6 +1852,7 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
     }
     g.vm=vm;g.submit=submit;g.ring=ring;g.clock=*clock;g.timer=timer;g.info=info;g.input_bits=input_bits;g.output_bits=output_bits;
     native_adreno_profile_set_continuous_clock(profileContinuousMicroseconds);
+    nabu_gpu_problem_log_initialize();
     g.service=service;g.published=true;
     service->setName("NativeAdrenoGpu");
     service->registerService();

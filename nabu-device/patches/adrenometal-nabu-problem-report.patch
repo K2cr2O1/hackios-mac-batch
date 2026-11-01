@@ -1,0 +1,117 @@
+diff --git a/NativeBridgeMetalFrontend.h b/NativeBridgeMetalFrontend.h
+--- a/NativeBridgeMetalFrontend.h
++++ b/NativeBridgeMetalFrontend.h
+@@ -13,6 +13,8 @@
+ id native_bridge_metal_library_with_air(const void *bytes, size_t length);
+ // One line for the plugin's status report: command buffers committed/failed locally, pipelines made, refusals, the last refusal's text.
+ size_t native_bridge_metal_status(char *out, size_t size);
++// nabu: one process-local diagnostic sink, installed before opening the device.
++void native_bridge_metal_set_problem_observer(void (*report)(const char *, void *), void *context);
+ // The pixel formats of the textures asked for (first eight distinct) and how many texture requests the runtime refused.
+ size_t native_bridge_metal_formats(char *out, size_t size);
+ size_t native_bridge_metal_telemetry(char *out, size_t size);
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -60,11 +60,22 @@
+ static std::mutex gCommitLock;
+ static std::mutex gProblemLock;
+ static char gLastProblems[2][200];
++static void (*gProblemObserver)(const char *,void *);
++static void *gProblemContext;
++extern "C" void native_bridge_metal_set_problem_observer(void (*report)(const char *,void *),void *context) {
++ gProblemContext=context;
++ __atomic_store_n(&gProblemObserver,report,__ATOMIC_RELEASE);
++}
+ static void noteProblem(NSString *what) {
+  gProblems++;
+- std::lock_guard<std::mutex> lock(gProblemLock);
+- memcpy(gLastProblems[1],gLastProblems[0],sizeof gLastProblems[0]);
+- strlcpy(gLastProblems[0],what.UTF8String?:"?",sizeof gLastProblems[0]);
++ const char *text=what.UTF8String?:"?";
++ {
++  std::lock_guard<std::mutex> lock(gProblemLock);
++  memcpy(gLastProblems[1],gLastProblems[0],sizeof gLastProblems[0]);
++  strlcpy(gLastProblems[0],text,sizeof gLastProblems[0]);
++ }
++ auto report=__atomic_load_n(&gProblemObserver,__ATOMIC_ACQUIRE);
++ if(report)report(text,gProblemContext);
+ }
+ #define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];NSLog(@"%@",nbText);noteProblem(nbText);}while(0)
+ // The pixel formats textures were asked for (first eight distinct), with how many were refused: native_bridge_metal_formats.
+diff --git a/ExceptionDiag.h b/ExceptionDiag.h
+--- a/ExceptionDiag.h
++++ b/ExceptionDiag.h
+@@ -14,6 +14,11 @@
+ 
+ static NSUncaughtExceptionHandler *gPrevious;
+ static char *gText;   // kept referenced: the text must stay in the heap until the process is gone
++static void (*gReport)(const char *,void *);
++static void *gReportContext;
++static void setReport(void (*report)(const char *,void *),void *context) {
++    gReport=report;gReportContext=context;
++}
+ 
+ static void handler(NSException *exception) {
+     @autoreleasepool {
+@@ -24,7 +29,10 @@
+         NSArray<NSNumber *> *frames = exception.callStackReturnAddresses;
+         for (NSUInteger i = 0; i < frames.count && i < 20; ++i) [text appendFormat:@" %llx", (unsigned long long)frames[i].unsignedLongLongValue];
+         for (NSUInteger i = 0; i < text.length; ++i) if ([text characterAtIndex:i] < 32 || [text characterAtIndex:i] > 126) [text replaceCharactersInRange:NSMakeRange(i, 1) withString:@"?"];
+-        if (const char *utf8 = text.UTF8String) gText = strdup(utf8);
++        if (const char *utf8 = text.UTF8String) {
++            gText = strdup(utf8);
++            if(gReport)gReport(utf8,gReportContext);
++        }
+     }
+     if (gPrevious) gPrevious(exception);
+ }
+diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -20,6 +20,7 @@
+ #include "PrimeShaders.h"
+ #include "ExceptionDiag.h"
+ #include "NativeAdrenoSystemFormatPolicy.h"
++#include "NabuGpuProblemStream.h"
+ 
+ @interface _MTLDevice : NSObject
+ @end
+@@ -63,6 +64,16 @@
+     gpu->port = port;
+     return gpu;
+ }
++static void nabuProblem(const char *text,void *context) {
++    Gpu *gpu=static_cast<Gpu *>(context);
++    nabuproblem::send([gpu](uint32_t value){gpu->mark(value);},text);
++}
++static void nabuException(const char *text,void *context) {
++    // Exception reports have a separate quota so earlier harmless capability
++    // queries cannot consume the abort's name, reason and original call stack.
++    Gpu *gpu=static_cast<Gpu *>(context);
++    nabuproblem::send([gpu](uint32_t value){gpu->mark(value);},text,true);
++}
+ static std::string gCacheDirectory;   // the runtime's cache directory (the one that opened the device), exported by CacheExport.h
+ // Progress markers 0x68xx (GPU6): 6800 entered, 6801 Turnip found, 6802 device made, 6803 returned to the discovery, 68f1 no Turnip, 68f2 no device.
+ static unsigned gDiagBits;
+@@ -209,6 +220,20 @@
+     @synchronized([NativeAdrenoMetalDeviceBase class]) {
+         if (tried) return device;
+         tried = true;
++        // Keep the accelerator port for the process's diagnostic lifetime.
++        if(void *iokit=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",RTLD_NOW|RTLD_LOCAL)) {
++            auto retain=(int (*)(unsigned))dlsym(iokit,"IOObjectRetain");
++            if(retain && retain(port)==0) {
++                if(Gpu *observer=makeGpu(port)) {
++                    native_bridge_metal_set_problem_observer(nabuProblem,observer);
++                    exceptiondiag::setReport(nabuException,observer);
++                    char line[96];
++                    snprintf(line,sizeof(line),"DEVICE %.64s %s",getprogname(),
++                        !strcmp(getprogname(),"backboardd") || listedClient()?"enabled":"unlisted");
++                    nabuProblem(line,observer);
++                }
++            }
++        }
+         exceptiondiag::start(); // the throw site of an uncaught exception, for the kernel's THROW row (ExceptionDiag.h)
+         // The board selects Turnip's render-pass and concurrent-binning options.
+         if (NATIVE_ADRENO_TURNIP_DEBUG[0]) {
