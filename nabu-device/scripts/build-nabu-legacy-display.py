@@ -158,8 +158,8 @@ def main():
         shutil.copy2(device / 'platform/NabuDisplayCallTrace.h',
                      source / 'NabuDisplayCallTrace.h')
     if producer_watch:
-        shutil.copy2(device / 'platform/NabuDisplayProducerWatch.h',
-                     source / 'NabuDisplayProducerWatch.h')
+        for name in ('NabuDisplayProducerWatch.h', 'NabuDisplayThreadState.h'):
+            shutil.copy2(device / 'platform' / name, source / name)
     shutil.copy2(device / 'platform/NabuLegacyStubs.cpp',
                  source / 'NabuLegacyStubs.cpp')
     shutil.copy2(device / 'platform/NabuGraphicsStatus.cpp',

@@ -26,6 +26,7 @@
 #error Producer watch requires the explicit CPU presentation and UI-watch build
 #endif
 #include "NabuDisplayProducerWatch.h"
+#include "NabuDisplayThreadState.h"
 // The enabled UI-watch source supplies this typed, try-lock-only osfmk sampler.
 extern "C" int nabu_ui_watch_thread_state(thread_t,uint32_t *,uint32_t *,uint64_t *);
 #endif
@@ -343,7 +344,7 @@ static unsigned displayProducersDump(char *out,unsigned cap) {
         at+=snprintf(out+at,cap-at,"R1 caller=%u pid=%d uid=%llu tid=%llu status=%s state=%x hint=%u wait_tag=%llx terminated=%u\n",
             i,caller.pid,(unsigned long long)caller.uniqueid,(unsigned long long)caller.tid,
             sampled==0?"sample_ok":sampled==1?"lock_busy":"unavailable",state,hint,
-            (unsigned long long)wait,sampled==0?unsigned((state&0x28)!=0):0);
+            (unsigned long long)wait,sampled==0?unsigned(nabu_display_thread_terminated(state)):0);
     }
     return at;
 }
