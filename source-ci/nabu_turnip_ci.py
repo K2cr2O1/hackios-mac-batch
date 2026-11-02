@@ -97,10 +97,14 @@ def main():
                         help='build the bounded scanout-source cache experiment on the four-patch plugin baseline')
     parser.add_argument('--async-fix', action='store_true',
                         help='qualify and build asynchronous Metal creation on the four-patch plugin baseline')
+    parser.add_argument('--completion-fix', action='store_true',
+                        help='build the command-buffer completion-wait decoupling on the four-patch plugin baseline')
     args = parser.parse_args()
     require(not args.fps_opt or args.plugin, '--fps-opt requires --plugin')
     require(not args.async_fix or args.plugin, '--async-fix requires --plugin')
-    require(not (args.async_fix and args.fps_opt), 'Keep async creation and FPS experiments separate')
+    require(not args.completion_fix or args.plugin, '--completion-fix requires --plugin')
+    require(sum((args.fps_opt, args.async_fix, args.completion_fix)) <= 1,
+            'Keep the async creation, FPS and completion-wait experiments separate')
     require(sys.platform == 'darwin' and os.environ.get('GITHUB_ACTIONS') == 'true', 'Run only in macOS GitHub Actions')
     device, root, output = args.device.resolve(), args.work.resolve(), args.output.resolve()
     abi = device / 'gpu/upstream/Adreno6xx'
@@ -169,7 +173,8 @@ def main():
             import nabu_metal_plugin_ci
             try:
                 plugin = nabu_metal_plugin_ci.build(root, device, output / 'plugin', env,
-                                                   fps_opt=args.fps_opt, async_fix=args.async_fix)
+                                                   fps_opt=args.fps_opt, async_fix=args.async_fix,
+                                                   completion_fix=args.completion_fix)
             except (subprocess.CalledProcessError, SystemExit, OSError, ValueError, KeyError) as error:
                 plugin = {'plugin_returncode': 1, 'bundle_built': False, 'error': str(error)[-2000:],
                           'gpu_exercised': False, 'runtime_qualified': False}

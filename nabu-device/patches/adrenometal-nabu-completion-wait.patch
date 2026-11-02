@@ -1,0 +1,26 @@
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1230,7 +1230,11 @@
+  if(!self.committed)return;
+  const uint64_t began=nowUs();
+  if(!self.failedLocally)nmb_command_buffer_wait(_handle,0);
+- dispatch_group_wait(_handlers,DISPATCH_TIME_FOREVER);
++ // Metal's wait contract ends at execution completion; user handler delivery
++ // is not part of it. Waiting on _handlers deadlocked whenever the delivered
++ // batch sat behind this caller on completionQueue, or a handler waited on its
++ // own buffer: the group leaves only inside that batch. The groups remain for
++ // handler-delivery diagnostics, not for the wait.
+  gTimeWaitCompleted.add(began);
+ }
+ - (void)waitUntilScheduled {
+@@ -1239,7 +1243,9 @@
+  if(!self.failedLocally && !nmb_command_buffer_wait_scheduled(_handle)){
+   NBLOG(@"native-metal: waitUntilScheduled refused: %@",lastError());return;
+  }
+- dispatch_group_wait(_schedulingHandlers,DISPATCH_TIME_FOREVER);
++ // Same decoupling for the scheduled state: the runtime wait covers
++ // submission. Holding _schedulingHandlers let a scheduled handler (run on the
++ // runtime's scheduled thread) deadlock itself and every later callback.
+  gTimeWaitScheduled.add(began);
+ }
+ @end
