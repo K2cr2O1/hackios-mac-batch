@@ -16,6 +16,11 @@
 #include <pexpert/pexpert.h>
 #include <mach/kmod.h>
 #include <machine/machine_routines.h>
+#include "NabuDisplayClientRegistry.h"
+#if defined(NABU_LEGACY_CPU_PRESENT)
+#include "NabuDisplayCallTrace.h"
+#include <kern/thread.h>
+#endif
 
 // nabu CPU-only adaptation: no GOP presenter, GPU hand-off or vsync backend.
 extern "C" void native_gop_presenter_static_init(void) {}
@@ -305,24 +310,95 @@ void native_legacy_client_enter(task_t task,uint32_t type) {
 // and registerNotificationPort(port,type,refCon), slot 175) are pointed at wrappers that count and forward to the original function. The original code
 // is not touched; only this object's vptr names the copy. XNU's ARM64 vptr points at slot 0 (the original code dispatches with ldr x8,[vptr,#slot*8]).
 enum {kSeenClients=8,kSelectors=96,kRegEvents=8,kVtableSlots=256};
-struct ClientStat {
-    uintptr_t object;int pid;char name[20];uint32_t calls,fails;uint32_t selector_calls[kSelectors],selector_fails[kSelectors],selector_status[kSelectors];
+struct ClientObservation {
+    uint32_t calls,fails;uint32_t selector_calls[kSelectors],selector_fails[kSelectors],selector_status[kSelectors];
     unsigned regs;struct {uint32_t type;uint64_t port;uint32_t ref,status;} reg[kRegEvents];
     uint64_t sel6_first[3],sel6_last[3];uint32_t sel6_distinct;uint64_t sel6_seen[8][3];uint32_t sel6_calls[8],sel6_fails[8],sel6_status[8];
     uint32_t seq_count;struct {uint32_t a,b,c,status,done,presented;} seq[24];
-    uintptr_t original_external,original_register;
 };
-static ClientStat seenClients[kSeenClients];static unsigned seenClientCount;
+using ClientRegistry=NabuDisplayClientRegistry<ClientObservation,kSeenClients,kVtableSlots>;
+using ClientStat=ClientRegistry::Slot;
+static ClientRegistry clientRegistry;
+#if defined(NABU_LEGACY_CPU_PRESENT)
+static NabuDisplayCallTrace displayCallTrace;
+static unsigned displayCallsDump(char *out,unsigned cap) {
+    if(!displayCallTrace.enabled() || !out || cap<=384)return 0;
+    NabuDisplayCallTrace::Snapshot snapshot;
+    const bool sampled=displayCallTrace.snapshot(snapshot);
+    const uint64_t now=probeNowUs();
+    char header[384];
+    unsigned rows=0,activeShown=0,recentShown=0;
+    auto row=[&](const NabuDisplayCallTrace::Entry &entry) {
+        char text[384];const auto &in=entry.input;
+        const uint64_t end=entry.state==1?now:entry.ended_us;
+        int length=snprintf(text,sizeof(text),"D1 call=%llu phase=%s pid=%d tid=%llu sel=%u scalars=%u/%llx/%llx/%llx bytes=%llu async=%u/%u start_us=%llu age_us=%llu end_us=%llu result=%x clock_skew=%u\n",
+            (unsigned long long)in.sequence,entry.state==1?"active":"returned",in.pid,
+            (unsigned long long)in.tid,in.selector,in.scalar_count,
+            (unsigned long long)in.scalars[0],(unsigned long long)in.scalars[1],(unsigned long long)in.scalars[2],
+            (unsigned long long)in.structure_bytes,in.async_port,in.async_refs,
+            (unsigned long long)in.started_us,(unsigned long long)(end>=in.started_us?end-in.started_us:0),
+            (unsigned long long)entry.ended_us,entry.result,unsigned(end<in.started_us));
+        if(length<=0 || unsigned(length)>=sizeof(text) || unsigned(length)>=cap-384-rows)return false;
+        memcpy(out+384+rows,text,unsigned(length));rows+=unsigned(length);return true;
+    };
+    if(sampled) {
+        for(unsigned i=0;i<snapshot.count && activeShown<4;++i)
+            if(snapshot.entries[i].state==1 && row(snapshot.entries[i]))++activeShown;
+        uint64_t before=UINT64_MAX;
+        for(unsigned r=0;r<2;++r) {
+            int latest=-1;
+            for(unsigned i=0;i<snapshot.count;++i) {
+                const auto &entry=snapshot.entries[i];
+                if(entry.state==2 && entry.input.sequence<before &&
+                    (latest<0 || entry.input.sequence>snapshot.entries[latest].input.sequence))latest=int(i);
+            }
+            if(latest<0)break;
+            before=snapshot.entries[latest].input.sequence;
+            if(row(snapshot.entries[latest]))++recentShown;
+        }
+    }
+    int length=snprintf(header,sizeof(header),"D1 snapshot=%s now_us=%llu enter=%llu/%llu/%llu return=%llu/%llu/%llu dropped=%llu",
+        sampled?"ok":"busy",(unsigned long long)now,
+        (unsigned long long)snapshot.entered[0],(unsigned long long)snapshot.entered[1],(unsigned long long)snapshot.entered[2],
+        (unsigned long long)snapshot.returned[0],(unsigned long long)snapshot.returned[1],(unsigned long long)snapshot.returned[2],
+        (unsigned long long)snapshot.dropped);
+    if(length<=0 || unsigned(length)+80>=sizeof(header))return 0;
+    if(sampled)length+=snprintf(header+length,sizeof(header)-unsigned(length)," active=%u shown=%u omitted=%u recent=%u\n",
+        snapshot.active,activeShown,snapshot.active-activeShown,recentShown);
+    else length+=snprintf(header+length,sizeof(header)-unsigned(length),"\n");
+    if(length<=0 || unsigned(length)>=sizeof(header))return 0;
+    memmove(out+length,out+384,rows);memcpy(out,header,unsigned(length));
+    out[unsigned(length)+rows]=0;return unsigned(length)+rows;
+}
+#endif
 typedef IOReturn (*ExternalFn)(IOUserClient *,uint32_t,IOExternalMethodArguments *,IOExternalMethodDispatch *,OSObject *,void *);
 typedef IOReturn (*RegisterFn)(IOUserClient *,mach_port_t,UInt32,UInt32);
 static ClientStat *statFor(IOUserClient *client) {
-    for(unsigned i=0;i<seenClientCount;++i)if(seenClients[i].object==(uintptr_t)client)return &seenClients[i];
-    return nullptr;
+    return clientRegistry.find(reinterpret_cast<uintptr_t>(client));
 }
 static IOReturn wrappedExternal(IOUserClient *client,uint32_t selector,IOExternalMethodArguments *args,IOExternalMethodDispatch *dispatch,OSObject *target,void *ref) {
     ClientStat *stat=statFor(client);
-    IOReturn status=stat?reinterpret_cast<ExternalFn>(stat->original_external)(client,selector,args,dispatch,target,ref):kIOReturnNotAttached;
-    if(stat) {
+#if defined(NABU_LEGACY_CPU_PRESENT)
+    NabuDisplayCallTrace::Lease lease;
+    if(displayCallTrace.enabled() && selector>=4 && selector<=6) {
+        NabuDisplayCallTrace::Input input;
+        input.pid=proc_selfpid();input.tid=thread_tid(current_thread());
+        input.started_us=probeNowUs();input.selector=selector;
+        if(args) {
+            input.scalar_count=args->scalarInputCount;input.structure_bytes=args->structureInputSize;
+            input.async_port=args->asyncWakePort?1:0;input.async_refs=args->asyncReferenceCount;
+            if(args->scalarInput)for(unsigned i=0;i<3 && i<args->scalarInputCount;++i)input.scalars[i]=args->scalarInput[i];
+        }
+        lease=displayCallTrace.begin(input);
+    }
+#endif
+    IOReturn status=stat?reinterpret_cast<ExternalFn>(stat->identity.original_external)(client,selector,args,dispatch,target,ref):kIOReturnNotAttached;
+#if defined(NABU_LEGACY_CPU_PRESENT)
+    displayCallTrace.finish(lease,lease.operation>=0?probeNowUs():0,uint32_t(status));
+#endif
+    // Observation contention must never refuse or delay the original method.
+    if(stat) stat->observe([&](ClientObservation &record) {
+        ClientObservation *stat=&record;
         if(selector==6 && args && args->scalarInput && args->scalarInputCount>=3) {
             const uint64_t *in=args->scalarInput;
             if(!stat->sel6_distinct && !stat->sel6_first[0] && !stat->sel6_first[1])memcpy(stat->sel6_first,in,sizeof stat->sel6_first);
@@ -339,27 +415,23 @@ static IOReturn wrappedExternal(IOUserClient *client,uint32_t selector,IOExterna
         }
         ++stat->calls;if(status)++stat->fails;
         if(selector<kSelectors){++stat->selector_calls[selector];if(status)++stat->selector_fails[selector];stat->selector_status[selector]=(uint32_t)status;}
-    }
+    });
     return status;
 }
 static IOReturn wrappedRegister(IOUserClient *client,mach_port_t port,UInt32 type,UInt32 refCon) {
     ClientStat *stat=statFor(client);
-    IOReturn status=stat?reinterpret_cast<RegisterFn>(stat->original_register)(client,port,type,refCon):kIOReturnNotAttached;
-    if(stat && stat->regs<kRegEvents){auto &e=stat->reg[stat->regs++];e.type=type;e.port=(uint64_t)(uintptr_t)port;e.ref=refCon;e.status=(uint32_t)status;}
+    IOReturn status=stat?reinterpret_cast<RegisterFn>(stat->identity.original_register)(client,port,type,refCon):kIOReturnNotAttached;
+    if(stat) stat->observe([&](ClientObservation &record) {
+        if(record.regs<kRegEvents){auto &e=record.reg[record.regs++];e.type=type;e.port=(uint64_t)(uintptr_t)port;e.ref=refCon;e.status=(uint32_t)status;}
+    });
     return status;
 }
 static void interpose(IOUserClient *client,int pid) {
-    if(seenClientCount>=kSeenClients)return;
-    ClientStat &stat=seenClients[seenClientCount];
-    memset(&stat,0,sizeof stat);
-    uintptr_t *vtable=*reinterpret_cast<uintptr_t **>(client);
-    uintptr_t *copy=static_cast<uintptr_t *>(IOMalloc(kVtableSlots*sizeof(uintptr_t)));
-    if(!copy)return;
-    memcpy(copy,vtable,kVtableSlots*sizeof(uintptr_t));
-    stat.object=(uintptr_t)client;stat.pid=pid;proc_name(pid,stat.name,(int)sizeof stat.name);stat.original_external=copy[168];stat.original_register=copy[175];
-    copy[168]=(uintptr_t)&wrappedExternal;copy[175]=(uintptr_t)&wrappedRegister;
-    ++seenClientCount;
-    *reinterpret_cast<uintptr_t **>(client)=copy;
+    char name[20]={};proc_name(pid,name,(int)sizeof name);
+    clientRegistry.install(reinterpret_cast<uintptr_t>(client),pid,name,
+        reinterpret_cast<uintptr_t>(&wrappedExternal),reinterpret_cast<uintptr_t>(&wrappedRegister),
+        [](size_t bytes)->void * {return IOMalloc(bytes);},
+        [](void *memory,size_t bytes) {IOFree(memory,bytes);});
 }
 // The display object's state words the original wait selector tests (offsets 5832..5864, as dwords), for the log.
 extern "C" unsigned native_legacy_state_words(char *out,unsigned cap) {
@@ -371,10 +443,25 @@ extern "C" unsigned native_legacy_state_words(char *out,unsigned cap) {
     return at;
 }
 extern "C" unsigned native_legacy_clients_dump(char *out,unsigned cap) {
+    if(!out || !cap)return 0;
     unsigned at=0;out[0]=0;
-    for(unsigned c=0;c<seenClientCount && at+120<cap;++c) {
-        const ClientStat &s=seenClients[c];
-        at+=snprintf(out+at,cap-at,"C%u pid=%d %s calls=%u fails=%u regs=%u",c,s.pid,s.name,s.calls,s.fails,s.regs);
+#if defined(NABU_LEGACY_CPU_PRESENT)
+    at=displayCallsDump(out,cap>1536?1536:cap);
+#endif
+    const auto registry=clientRegistry.summary();
+    if(at+192<cap)at+=snprintf(out+at,cap-at,"O1 clients=%u busy=%llu full=%llu failed=%llu duplicates=%llu\n",registry.count,
+        (unsigned long long)registry.busy,(unsigned long long)registry.full,
+        (unsigned long long)registry.failed,(unsigned long long)registry.duplicates);
+    for(unsigned c=0;c<registry.count && at+192<cap;++c) {
+        ClientStat *slot=clientRegistry.at(c);
+        const auto &identity=slot->identity;
+        ClientObservation s={};
+        if(!slot->snapshot(s)) {
+            at+=snprintf(out+at,cap-at,"C%u pid=%d %s observation=busy\n",c,identity.pid,identity.name);
+            continue;
+        }
+        at+=snprintf(out+at,cap-at,"C%u pid=%d %s calls=%u fails=%u regs=%u observation_dropped=%llu",c,identity.pid,identity.name,s.calls,s.fails,s.regs,
+            (unsigned long long)__atomic_load_n(&slot->observation_dropped,__ATOMIC_RELAXED));
         for(unsigned r=0;r<s.regs && r<kRegEvents && at+60<cap;++r)
             at+=snprintf(out+at,cap-at," reg(t%u,p%llx,r%x)=%x",s.reg[r].type,(unsigned long long)s.reg[r].port,s.reg[r].ref,s.reg[r].status);
         at+=snprintf(out+at,cap-at,"\n");
@@ -397,9 +484,11 @@ void native_legacy_client_observed(IOReturn status,IOUserClient *client) {
 #if defined(NABU_LEGACY_CPU_PRESENT)
     // Opt-in with the display status samples: count each original client's selectors (no call is changed).
     unsigned counted=0;PE_parse_boot_argn("nabu-display-status",&counted,sizeof(counted));
-    if(counted==1 && client && !status)interpose(client,native_legacy_client_pid);
+    unsigned traced=0;PE_parse_boot_argn("nabu-display-call-trace",&traced,sizeof(traced));
+    if(counted==1 && traced==1)displayCallTrace.enable();
+    if(counted==1 && client && !status)interpose(client,proc_selfpid());
 #elif !defined(NABU_LEGACY_DISCOVERY_ONLY)
-    if(client && !status)interpose(client,native_legacy_client_pid);
+    if(client && !status)interpose(client,proc_selfpid());
 #endif
     native_legacy_client_status=status;native_legacy_client_object=(uintptr_t)client;
     if(client)strlcpy(native_legacy_client_class,client->getMetaClass()->getClassName(),sizeof(native_legacy_client_class));

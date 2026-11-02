@@ -151,6 +151,11 @@ def main():
             shutil.copy2(device / 'vendor/GopFramebuffer-cf3b429' / name, source / name)
     shutil.copy2(device / 'platform/NabuLegacyDisplayProbe.cpp',
                  source / 'NabuLegacyDisplayProbe.cpp')
+    shutil.copy2(device / 'platform/NabuDisplayClientRegistry.h',
+                 source / 'NabuDisplayClientRegistry.h')
+    if cpu:
+        shutil.copy2(device / 'platform/NabuDisplayCallTrace.h',
+                     source / 'NabuDisplayCallTrace.h')
     shutil.copy2(device / 'platform/NabuLegacyStubs.cpp',
                  source / 'NabuLegacyStubs.cpp')
     shutil.copy2(device / 'platform/NabuGraphicsStatus.cpp',
