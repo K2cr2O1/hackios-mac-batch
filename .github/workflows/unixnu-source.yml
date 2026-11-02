@@ -34,6 +34,10 @@ on:
         description: Turnip-only experiment; reuse bounded kernel scanout sources on the desktop-capable plugin baseline
         type: boolean
         default: false
+      async_fix:
+        description: Turnip-only async Metal creation fix and bounded callback regression; no device installation
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -67,8 +71,10 @@ jobs:
           GPU_USERPROBE: ${{ inputs.gpu_userprobe }}
           UI_WATCH: ${{ inputs.ui_watch }}
           FPS_OPT: ${{ inputs.fps_opt }}
+          ASYNC_FIX: ${{ inputs.async_fix }}
         run: |
           test "$FPS_OPT" != true
+          test "$ASYNC_FIX" != true
           test "$REQUESTED_REF" = 245aca1a9ec5b730b1cad80fade295800d2981f1
           if [ "$GPU_USERPROBE" = true ]; then test "$REQUESTED_CONFIG" = nabu_ufs_gpu_metal_defconfig; fi
           test -d "$DEVELOPER_DIR"
@@ -213,9 +219,14 @@ jobs:
         id: turnip
         env:
           FPS_OPT: ${{ inputs.fps_opt }}
+          ASYNC_FIX: ${{ inputs.async_fix }}
         run: |
           fps_args=()
           if [ "$FPS_OPT" = true ]; then fps_args+=(--fps-opt); fi
+          if [ "$ASYNC_FIX" = true ]; then
+            test "$FPS_OPT" != true
+            fps_args+=(--async-fix)
+          fi
           python3 source-ci/nabu_turnip_ci.py --device nabu-device --plugin \
             --work "$RUNNER_TEMP/unixnu-turnip" --output "$RUNNER_TEMP/turnip-output" "${fps_args[@]}"
       - name: Upload private output (including failed builds)

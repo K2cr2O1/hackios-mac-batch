@@ -1,0 +1,78 @@
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -528,8 +528,15 @@
+  function.constantsText=text;if(error)*error=nil;return (id<MTLFunction>)function;
+ }
+ - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
+- NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values error:&error];
+- handler(function,error);
++ if(!handler)return;
++ NSString *functionName=[name copy];
++ MTLFunctionConstantValues *constants=[values copy];
++ dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
++  @autoreleasepool {
++   NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:functionName constantValues:constants error:&error];
++   handler(function,error);
++  }
++ });
+ }
+ - (MTLLibraryType)type {return MTLLibraryTypeExecutable;}
+ // The descriptor's name and constants; its specialized name only labels Metal's function and its options ask for compile-time work the
+@@ -1733,25 +1740,47 @@
+  if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
+  NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
+ }
+-// The asynchronous forms make the pipeline on the caller's thread and call the handler before returning, as the library's
+-// newFunctionWithName:constantValues:completionHandler: does (RenderBox's pipeline loader, Core Image's bilateral solver).
+ - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d completionHandler:(MTLNewRenderPipelineStateCompletionHandler)handler {
+- NSError *error=nil;id<MTLRenderPipelineState> state=[(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d error:&error];
+- handler(state,error);
++ if(!handler)return;
++ MTLRenderPipelineDescriptor *descriptor=[d copy];
++ dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
++  @autoreleasepool {
++   NSError *error=nil;id<MTLRenderPipelineState> state=[(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:descriptor error:&error];
++   handler(state,error);
++  }
++ });
+ }
+ - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d options:(MTLPipelineOption)options
+                            completionHandler:(MTLNewRenderPipelineStateWithReflectionCompletionHandler)handler {
+- NSError *error=nil;id<MTLRenderPipelineState> state=[(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d options:options reflection:nil error:&error];
+- handler(state,nil,error);
++ if(!handler)return;
++ MTLRenderPipelineDescriptor *descriptor=[d copy];
++ dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
++  @autoreleasepool {
++   NSError *error=nil;MTLRenderPipelineReflection *reflection=nil;
++   id<MTLRenderPipelineState> state=[(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:descriptor options:options reflection:&reflection error:&error];
++   handler(state,reflection,error);
++  }
++ });
+ }
+ - (void)newComputePipelineStateWithFunction:(id<MTLFunction>)function completionHandler:(MTLNewComputePipelineStateCompletionHandler)handler {
+- NSError *error=nil;id<MTLComputePipelineState> state=[(id<MTLDevice>)self newComputePipelineStateWithFunction:function error:&error];
+- handler(state,error);
++ if(!handler)return;
++ dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
++  @autoreleasepool {
++   NSError *error=nil;id<MTLComputePipelineState> state=[(id<MTLDevice>)self newComputePipelineStateWithFunction:function error:&error];
++   handler(state,error);
++  }
++ });
+ }
+ - (void)newComputePipelineStateWithFunction:(id<MTLFunction>)function options:(MTLPipelineOption)options
+                           completionHandler:(MTLNewComputePipelineStateWithReflectionCompletionHandler)handler {
+- NSError *error=nil;id<MTLComputePipelineState> state=[(id<MTLDevice>)self newComputePipelineStateWithFunction:function options:options reflection:nil error:&error];
+- handler(state,nil,error);
++ if(!handler)return;
++ dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
++  @autoreleasepool {
++   NSError *error=nil;MTLComputePipelineReflection *reflection=nil;
++   id<MTLComputePipelineState> state=[(id<MTLDevice>)self newComputePipelineStateWithFunction:function options:options reflection:&reflection error:&error];
++   handler(state,reflection,error);
++  }
++ });
+ }
+ // SPI: a precompiled pipeline library (RenderBox.framework/default.pipelinelib) holds Apple GPU binaries. None is opened; the caller logs the
+ // error and builds its pipelines from the shader library instead (RB::Device::render_pipeline_state).
