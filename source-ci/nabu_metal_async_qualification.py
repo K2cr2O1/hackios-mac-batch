@@ -50,7 +50,7 @@ static void waitFor(dispatch_semaphore_t semaphore) {
  unsigned kind;
  BOOL failing;
 }
-@property(nonatomic,strong) dispatch_semaphore_t entered,release,done;
+@property(nonatomic,strong) dispatch_semaphore_t entered,resumeCompilation,done;
 @property(nonatomic,strong) NSLock *callerLock;
 @property(nonatomic,strong) NSObject *result,*reflection;
 @property(nonatomic,strong) NSError *failure;
@@ -64,7 +64,7 @@ static void waitFor(dispatch_semaphore_t semaphore) {
  creations.fetch_add(1);
  bool onCaller=pthread_equal(caller,pthread_self());inlineCreation.store(onCaller);
  dispatch_semaphore_signal(self.entered);
- if(!onCaller)waitFor(self.release);
+ if(!onCaller)waitFor(self.resumeCompilation);
  if(!onCaller){
   if(kind<3){
    require((uintptr_t)(__bridge void *)input!=inputIdentity,"descriptor/constants snapshot");
@@ -130,7 +130,7 @@ int main(int argc,char **argv) {
   NBTestProbe *probe=[NBTestProbe new];probe->kind=unsigned(atoi(argv[1]));probe->failing=atoi(argv[2]);
   require(probe->kind<5,"kind");probe->caller=pthread_self();
   probe->creations.store(0);probe->callbacks.store(0);probe->inlineCreation.store(false);
-  probe.entered=dispatch_semaphore_create(0);probe.release=dispatch_semaphore_create(0);probe.done=dispatch_semaphore_create(0);
+  probe.entered=dispatch_semaphore_create(0);probe.resumeCompilation=dispatch_semaphore_create(0);probe.done=dispatch_semaphore_create(0);
   probe.callerLock=[NSLock new];probe.result=[NSObject new];probe.reflection=[NSObject new];
   probe.failure=[NSError errorWithDomain:@"stub-compiler" code:37 userInfo:nil];
   NSMutableString *name=[NSMutableString stringWithString:@"before"];
@@ -156,7 +156,7 @@ int main(int argc,char **argv) {
   require(weakOwner!=nil,"queued work retains receiver");
   if(probe->kind>=3)require(weakFunction!=nil,"queued work retains function");
   require(probe->callbacks.load()==0,"callback waits for compilation");
-  dispatch_semaphore_signal(probe.release);[probe.callerLock unlock];waitFor(probe.done);
+  dispatch_semaphore_signal(probe.resumeCompilation);[probe.callerLock unlock];waitFor(probe.done);
   require(probe->creations.load()==1&&probe->callbacks.load()==1,"exactly one creation and callback");
   printf("PASS async kind=%u failure=%d snapshot/lifetime/lock/result\n",probe->kind,probe->failing);
  }
