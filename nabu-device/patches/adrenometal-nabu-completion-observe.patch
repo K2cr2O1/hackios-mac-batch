@@ -1,0 +1,299 @@
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -40,6 +40,50 @@
+ // What this device has been asked and refused, for the plugin's status line (native_bridge_metal_status): commits, render/compute pipelines made,
+ // refusals, and the last two refusals' texts. Counters only; nothing here changes a result.
+ static std::atomic<uint64_t> gCommits,gCommitFailures,gPipelines,gProblems,gCompleted;
++namespace nabu_completion_observe {
++static_assert(ATOMIC_LLONG_LOCK_FREE==2,"observer requires lock-free 64-bit counters");
++static std::atomic<unsigned long long> finishEnter;
++static std::atomic<unsigned long long> finishReturn;
++static std::atomic<unsigned long long> queued;
++static std::atomic<unsigned long long> batchEnter;
++static std::atomic<unsigned long long> batchReturn;
++static std::atomic<unsigned long long> handlerEnter;
++static std::atomic<unsigned long long> handlerReturn;
++static std::atomic<unsigned long long> waitCompletedEnter;
++static std::atomic<unsigned long long> waitCompletedRuntime;
++static std::atomic<unsigned long long> waitCompletedReturn;
++static std::atomic<unsigned long long> pipelineScopeEnter;
++static std::atomic<unsigned long long> pipelineScopeExit;
++static std::atomic<unsigned long long> asyncAPIEnter;
++static std::atomic<unsigned long long> asyncHandlerEnter;
++static std::atomic<unsigned long long> asyncHandlerReturn;
++static std::atomic<unsigned long long> scheduleEnter;
++static std::atomic<unsigned long long> scheduleReturn;
++static std::atomic<unsigned long long> scheduledEnter;
++static std::atomic<unsigned long long> scheduledReturn;
++static std::atomic<unsigned long long> waitScheduledEnter;
++static std::atomic<unsigned long long> waitScheduledRuntime;
++static std::atomic<unsigned long long> waitScheduledReturn;
++static std::atomic<unsigned long long> commitEnter;
++static std::atomic<unsigned long long> commitPublished;
++static std::atomic<unsigned long long> completedEnter;
++static std::atomic<unsigned long long> completedLock;
++static std::atomic<unsigned long long> functionScopeEnter;
++static std::atomic<unsigned long long> functionScopeExit;
++
++static unsigned shown(const std::atomic<unsigned long long> &v) {
++ const unsigned long long n=v.load(std::memory_order_relaxed);return n>46655?46655:unsigned(n);
++}
++static void encode(char *out,const std::atomic<unsigned long long> &v) {
++ static const char digits[]="0123456789abcdefghijklmnopqrstuvwxyz";
++ unsigned n=shown(v);for(int i=2;i>=0;--i){out[i]=digits[n%36];n/=36;}
++}
++struct ScopeSpan {
++ std::atomic<unsigned long long> &exit;
++ ScopeSpan(std::atomic<unsigned long long> &enter,std::atomic<unsigned long long> &leave):exit(leave){enter.fetch_add(1,std::memory_order_relaxed);}
++ ~ScopeSpan(){exit.fetch_add(1,std::memory_order_relaxed);}
++};
++}
+ // What the render server actually asks of the GPU (int-141: 59 commits in 200 s, and a desktop that behaves like CPU compositing): render passes,
+ // draws, the pixels of their first colour attachment, compute dispatches, blits and the largest pass (pixels).
+ static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBiggestPass,gFullScreenPasses;
+@@ -488,7 +532,8 @@
+ static std::string quartzCoreCallers();
+ @implementation NBLibrary
+ - (void)dealloc {nmb_library_release(_handle);}
+-- (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
++- (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error { nabu_completion_observe::ScopeSpan scopeSpan(nabu_completion_observe::functionScopeEnter,nabu_completion_observe::functionScopeExit);
++
+  if(!name || !values || !methodABI(values,@selector(newIndexedConstantArray),"@16@0:8") || !methodABI(values,@selector(newNamedConstantArray),"@16@0:8")) {
+   if(error)*error=nbError(@"unqualified function constant values");return nil;
+  }
+@@ -528,8 +573,11 @@
+  function.constantsText=text;if(error)*error=nil;return (id<MTLFunction>)function;
+ }
+ - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
++ nabu_completion_observe::asyncAPIEnter.fetch_add(1,std::memory_order_relaxed);
+  NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values error:&error];
++ nabu_completion_observe::asyncHandlerEnter.fetch_add(1,std::memory_order_relaxed);
+  handler(function,error);
++ nabu_completion_observe::asyncHandlerReturn.fetch_add(1,std::memory_order_relaxed);
+ }
+ - (MTLLibraryType)type {return MTLLibraryTypeExecutable;}
+ // The descriptor's name and constants; its specialized name only labels Metal's function and its options ask for compile-time work the
+@@ -548,7 +596,8 @@
+  }
+  return names;
+ }
+-- (id<MTLFunction>)newFunctionWithName:(NSString *)name {
++- (id<MTLFunction>)newFunctionWithName:(NSString *)name { nabu_completion_observe::ScopeSpan scopeSpan(nabu_completion_observe::functionScopeEnter,nabu_completion_observe::functionScopeExit);
++
+  const uint64_t functionBegan=nowUs();
+  NmbFunction *handle=name?nmb_function_new(_handle,name.UTF8String):nullptr;gTimeFunction.add(functionBegan);
+  if(!handle)return nil;
+@@ -1152,6 +1201,7 @@
+ - (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value {[self event:event value:value signal:false];}
+ // The runtime has submitted the work. Deliver scheduling without waiting for GPU completion.
+ - (void)didSchedule {
++ nabu_completion_observe::scheduleEnter.fetch_add(1,std::memory_order_relaxed);
+  {
+   const uint64_t took=nowUs()-self.committedUs;
+   std::lock_guard<std::mutex> lock(gCommitLock);
+@@ -1163,16 +1213,22 @@
+   _schedulingDelivered=YES;handlers=[_scheduledHandlers copy];[_scheduledHandlers removeAllObjects];
+  }
+  void (^run)(void)=^{
+-  for(MTLCommandBufferHandler block in handlers)block((id<MTLCommandBuffer>)self);
++  for(MTLCommandBufferHandler block in handlers){
++   nabu_completion_observe::scheduledEnter.fetch_add(1,std::memory_order_relaxed);
++   block((id<MTLCommandBuffer>)self);
++   nabu_completion_observe::scheduledReturn.fetch_add(1,std::memory_order_relaxed);
++  }
+   dispatch_group_leave(self->_schedulingHandlers);
+  };
+  // Run on the runtime's scheduled-handler thread, preserving its ordering and own-wait
+  // deadlock checks. The queue's completionQueue routes completed handlers only.
+  run();
++ nabu_completion_observe::scheduleReturn.fetch_add(1,std::memory_order_relaxed);
+ }
+ // Completion releases retained resources and then delivers completed handlers.
+ // The frontend flushes surfaces only when the driver requires CPU cache operations here.
+ - (void)finish {
++ nabu_completion_observe::finishEnter.fetch_add(1,std::memory_order_relaxed);
+  flushSurfaces(_surfaces);
+  // Actual GPU completion (or a local refusal that never submitted) is the
+  // release point. A retained completed command must not pin every old frame.
+@@ -1194,13 +1250,21 @@
+   completedHandlers=[_completedHandlers copy];[_completedHandlers removeAllObjects];
+  }
+  void (^run)(void)=^{
+-  for(MTLCommandBufferHandler block in completedHandlers)block((id<MTLCommandBuffer>)self);
++  nabu_completion_observe::batchEnter.fetch_add(1,std::memory_order_relaxed);
++  for(MTLCommandBufferHandler block in completedHandlers){
++   nabu_completion_observe::handlerEnter.fetch_add(1,std::memory_order_relaxed);
++   block((id<MTLCommandBuffer>)self);
++   nabu_completion_observe::handlerReturn.fetch_add(1,std::memory_order_relaxed);
++  }
+   dispatch_group_leave(self->_handlers);
++  nabu_completion_observe::batchReturn.fetch_add(1,std::memory_order_relaxed);
+  };
+  dispatch_queue_t queue=_queue.completionQueue;
+- if(queue)dispatch_async(queue,run);else run();
++ if(queue){nabu_completion_observe::queued.fetch_add(1,std::memory_order_relaxed);dispatch_async(queue,run);}else run();
++ nabu_completion_observe::finishReturn.fetch_add(1,std::memory_order_relaxed);
+ }
+ - (void)commit {
++ nabu_completion_observe::commitEnter.fetch_add(1,std::memory_order_relaxed);
+  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
+  self.committed=YES;
+  self.committedUs=nowUs();
+@@ -1211,6 +1275,7 @@
+   CommitRecord &r=gCommitRing[index%32];
+   r={};r.index=index;r.committedUs=self.committedUs;r.ageUs=self.committedUs-createdUs;r.work=encodedWork;
+  }
++ nabu_completion_observe::commitPublished.fetch_add(1,std::memory_order_relaxed);
+  dispatch_group_enter(_handlers);
+  dispatch_group_enter(_schedulingHandlers);
+  @synchronized(gInFlight){[gInFlight addObject:self];}
+@@ -1228,24 +1293,37 @@
+ }
+ - (void)waitUntilCompleted {
+  if(!self.committed)return;
++ nabu_completion_observe::waitCompletedEnter.fetch_add(1,std::memory_order_relaxed);
+  const uint64_t began=nowUs();
+  if(!self.failedLocally)nmb_command_buffer_wait(_handle,0);
++ nabu_completion_observe::waitCompletedRuntime.fetch_add(1,std::memory_order_relaxed);
+  dispatch_group_wait(_handlers,DISPATCH_TIME_FOREVER);
++ nabu_completion_observe::waitCompletedReturn.fetch_add(1,std::memory_order_relaxed);
+  gTimeWaitCompleted.add(began);
+ }
+ - (void)waitUntilScheduled {
+  if(!self.committed)return;
++ nabu_completion_observe::waitScheduledEnter.fetch_add(1,std::memory_order_relaxed);
+  const uint64_t began=nowUs();
+- if(!self.failedLocally && !nmb_command_buffer_wait_scheduled(_handle)){
+-  NBLOG(@"native-metal: waitUntilScheduled refused: %@",lastError());return;
++ if(!self.failedLocally){
++  const bool waitResult=nmb_command_buffer_wait_scheduled(_handle);
++ nabu_completion_observe::waitScheduledRuntime.fetch_add(1,std::memory_order_relaxed);
++  if(!waitResult){
++   NBLOG(@"native-metal: waitUntilScheduled refused: %@",lastError());
++   nabu_completion_observe::waitScheduledReturn.fetch_add(1,std::memory_order_relaxed);return;
++  }
++ }else{
++  nabu_completion_observe::waitScheduledRuntime.fetch_add(1,std::memory_order_relaxed);
+  }
+  dispatch_group_wait(_schedulingHandlers,DISPATCH_TIME_FOREVER);
++ nabu_completion_observe::waitScheduledReturn.fetch_add(1,std::memory_order_relaxed);
+  gTimeWaitScheduled.add(began);
+ }
+ @end
+ static void scheduled(void *context) {[(__bridge NBCommandBuffer *)context didSchedule];}
+ // The runtime's completion: the command buffer's own reference, taken at commit, is given back here.
+ static void completed(void *context) {
++ nabu_completion_observe::completedEnter.fetch_add(1,std::memory_order_relaxed);
+  gCompleted++;
+  NBCommandBuffer *commandBuffer=(__bridge_transfer NBCommandBuffer *)context;
+  {
+@@ -1256,6 +1334,7 @@
+   CommitRecord &r=gCommitRing[commandBuffer.commitIndex%32];
+   if(r.index==commandBuffer.commitIndex)r.callbackUs=took;
+  }
++ nabu_completion_observe::completedLock.fetch_add(1,std::memory_order_relaxed);
+  [commandBuffer finish];
+ }
+ 
+@@ -1694,7 +1773,8 @@
+  return [(id<MTLDevice>)self newComputePipelineStateWithFunction:function options:MTLPipelineOptionNone reflection:nil error:error];
+ }
+ - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function options:(MTLPipelineOption)options
+-                                                         reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
++                                                         reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error { nabu_completion_observe::ScopeSpan scopeSpan(nabu_completion_observe::pipelineScopeEnter,nabu_completion_observe::pipelineScopeExit);
++
+  if(reflection)*reflection=nil;
+  if(![(id)function isKindOfClass:[NBFunction class]]){if(error)*error=nbError(@"foreign function");return nil;}
+  const NmbPipelineOptions creation={(uint64_t)options,nullptr,0};
+@@ -1704,7 +1784,8 @@
+  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLComputePipelineState>)state;
+ }
+ - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options
+-                                                       reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
++                                                       reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error { nabu_completion_observe::ScopeSpan scopeSpan(nabu_completion_observe::pipelineScopeEnter,nabu_completion_observe::pipelineScopeExit);
++
+  if(reflection)*reflection=nil;
+  NmbComputePipelineDescriptor p={};if(!computeDescriptor(d,&p,error))return nil;
+  std::vector<NmbBinaryArchive *> archives;
+@@ -1720,7 +1801,8 @@
+  return [(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:error];
+ }
+ - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d options:(MTLPipelineOption)options
+-                                                        reflection:(MTLAutoreleasedRenderPipelineReflection *)reflection error:(NSError **)error {
++                                                        reflection:(MTLAutoreleasedRenderPipelineReflection *)reflection error:(NSError **)error { nabu_completion_observe::ScopeSpan scopeSpan(nabu_completion_observe::pipelineScopeEnter,nabu_completion_observe::pipelineScopeExit);
++
+  if(reflection)*reflection=nil;
+  auto *p=new NmbRenderPipelineDescriptor();
+  if(!renderDescriptor(d,p,error)){delete p;return nil;}
+@@ -1736,22 +1818,34 @@
+ // The asynchronous forms make the pipeline on the caller's thread and call the handler before returning, as the library's
+ // newFunctionWithName:constantValues:completionHandler: does (RenderBox's pipeline loader, Core Image's bilateral solver).
+ - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d completionHandler:(MTLNewRenderPipelineStateCompletionHandler)handler {
++ nabu_completion_observe::asyncAPIEnter.fetch_add(1,std::memory_order_relaxed);
+  NSError *error=nil;id<MTLRenderPipelineState> state=[(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d error:&error];
++ nabu_completion_observe::asyncHandlerEnter.fetch_add(1,std::memory_order_relaxed);
+  handler(state,error);
++ nabu_completion_observe::asyncHandlerReturn.fetch_add(1,std::memory_order_relaxed);
+ }
+ - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d options:(MTLPipelineOption)options
+                            completionHandler:(MTLNewRenderPipelineStateWithReflectionCompletionHandler)handler {
++ nabu_completion_observe::asyncAPIEnter.fetch_add(1,std::memory_order_relaxed);
+  NSError *error=nil;id<MTLRenderPipelineState> state=[(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d options:options reflection:nil error:&error];
++ nabu_completion_observe::asyncHandlerEnter.fetch_add(1,std::memory_order_relaxed);
+  handler(state,nil,error);
++ nabu_completion_observe::asyncHandlerReturn.fetch_add(1,std::memory_order_relaxed);
+ }
+ - (void)newComputePipelineStateWithFunction:(id<MTLFunction>)function completionHandler:(MTLNewComputePipelineStateCompletionHandler)handler {
++ nabu_completion_observe::asyncAPIEnter.fetch_add(1,std::memory_order_relaxed);
+  NSError *error=nil;id<MTLComputePipelineState> state=[(id<MTLDevice>)self newComputePipelineStateWithFunction:function error:&error];
++ nabu_completion_observe::asyncHandlerEnter.fetch_add(1,std::memory_order_relaxed);
+  handler(state,error);
++ nabu_completion_observe::asyncHandlerReturn.fetch_add(1,std::memory_order_relaxed);
+ }
+ - (void)newComputePipelineStateWithFunction:(id<MTLFunction>)function options:(MTLPipelineOption)options
+                           completionHandler:(MTLNewComputePipelineStateWithReflectionCompletionHandler)handler {
++ nabu_completion_observe::asyncAPIEnter.fetch_add(1,std::memory_order_relaxed);
+  NSError *error=nil;id<MTLComputePipelineState> state=[(id<MTLDevice>)self newComputePipelineStateWithFunction:function options:options reflection:nil error:&error];
++ nabu_completion_observe::asyncHandlerEnter.fetch_add(1,std::memory_order_relaxed);
+  handler(state,nil,error);
++ nabu_completion_observe::asyncHandlerReturn.fetch_add(1,std::memory_order_relaxed);
+ }
+ // SPI: a precompiled pipeline library (RenderBox.framework/default.pipelinelib) holds Apple GPU binaries. None is opened; the caller logs the
+ // error and builds its pipelines from the shader library instead (RB::Device::render_pipeline_state).
+@@ -1979,6 +2073,36 @@
+   (unsigned long long)gDraws.load(),(unsigned long long)gFullScreenPasses.load(),(unsigned long long)(gBiggestPass.load()>>10),
+   (unsigned long long)gDispatches.load(),(unsigned long long)gBlits.load());
+  row("T pipeline n=%llu total=%llums max=%llums",(unsigned long long)gTimePipeline.count.load(),ms(gTimePipeline.total.load()),ms(gTimePipeline.slowest.load()));
++ char packed[85]={};
++ nabu_completion_observe::encode(packed+0,nabu_completion_observe::finishEnter);
++ nabu_completion_observe::encode(packed+3,nabu_completion_observe::finishReturn);
++ nabu_completion_observe::encode(packed+6,nabu_completion_observe::queued);
++ nabu_completion_observe::encode(packed+9,nabu_completion_observe::batchEnter);
++ nabu_completion_observe::encode(packed+12,nabu_completion_observe::batchReturn);
++ nabu_completion_observe::encode(packed+15,nabu_completion_observe::handlerEnter);
++ nabu_completion_observe::encode(packed+18,nabu_completion_observe::handlerReturn);
++ nabu_completion_observe::encode(packed+21,nabu_completion_observe::waitCompletedEnter);
++ nabu_completion_observe::encode(packed+24,nabu_completion_observe::waitCompletedRuntime);
++ nabu_completion_observe::encode(packed+27,nabu_completion_observe::waitCompletedReturn);
++ nabu_completion_observe::encode(packed+30,nabu_completion_observe::pipelineScopeEnter);
++ nabu_completion_observe::encode(packed+33,nabu_completion_observe::pipelineScopeExit);
++ nabu_completion_observe::encode(packed+36,nabu_completion_observe::asyncAPIEnter);
++ nabu_completion_observe::encode(packed+39,nabu_completion_observe::asyncHandlerEnter);
++ nabu_completion_observe::encode(packed+42,nabu_completion_observe::asyncHandlerReturn);
++ nabu_completion_observe::encode(packed+45,nabu_completion_observe::scheduleEnter);
++ nabu_completion_observe::encode(packed+48,nabu_completion_observe::scheduleReturn);
++ nabu_completion_observe::encode(packed+51,nabu_completion_observe::scheduledEnter);
++ nabu_completion_observe::encode(packed+54,nabu_completion_observe::scheduledReturn);
++ nabu_completion_observe::encode(packed+57,nabu_completion_observe::waitScheduledEnter);
++ nabu_completion_observe::encode(packed+60,nabu_completion_observe::waitScheduledRuntime);
++ nabu_completion_observe::encode(packed+63,nabu_completion_observe::waitScheduledReturn);
++ nabu_completion_observe::encode(packed+66,nabu_completion_observe::commitEnter);
++ nabu_completion_observe::encode(packed+69,nabu_completion_observe::commitPublished);
++ nabu_completion_observe::encode(packed+72,nabu_completion_observe::completedEnter);
++ nabu_completion_observe::encode(packed+75,nabu_completion_observe::completedLock);
++ nabu_completion_observe::encode(packed+78,nabu_completion_observe::functionScopeEnter);
++ nabu_completion_observe::encode(packed+81,nabu_completion_observe::functionScopeExit);
++ row("H1 %s",packed);
+  row("T library n=%llu total=%llums max=%llums",(unsigned long long)gTimeLibrary.count.load(),ms(gTimeLibrary.total.load()),ms(gTimeLibrary.slowest.load()));
+  row("T function n=%llu total=%llums max=%llums",
+   (unsigned long long)gTimeFunction.count.load(),ms(gTimeFunction.total.load()),ms(gTimeFunction.slowest.load()));

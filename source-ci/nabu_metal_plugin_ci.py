@@ -33,6 +33,8 @@ ASYNC_PATCH = 'patches/adrenometal-nabu-async-creation.patch'
 ASYNC_PATCHES = ADRENOMETAL_PATCHES[:4] + (ASYNC_PATCH,)
 COMPLETION_PATCH = 'patches/adrenometal-nabu-completion-wait.patch'
 COMPLETION_PATCHES = ADRENOMETAL_PATCHES[:4] + (COMPLETION_PATCH,)
+COMPLETION_OBSERVE_PATCH = 'patches/adrenometal-nabu-completion-observe.patch'
+COMPLETION_OBSERVE_PATCHES = ADRENOMETAL_PATCHES[:4] + (COMPLETION_OBSERVE_PATCH,)
 UNDEPLOYED = ('adrenoprobed', 'adrenoprobed-entitlements.plist', 'org.blu-sharky.adrenoprobed.plist',
               'com.apple.iomfb_fdr_loader.plist', 'com.apple.bluetoothd.plist')
 
@@ -60,19 +62,21 @@ def fetch(path, url, commit, *, blob_filter=False):
         raise SystemExit('Pinned checkout differs: ' + str(path))
 
 
-def plugin_patches(fps_opt=False, async_fix=False, completion_fix=False):
-    if sum((fps_opt, async_fix, completion_fix)) > 1:
-        raise ValueError('Keep the async creation, FPS and completion-wait experiments separate')
+def plugin_patches(fps_opt=False, async_fix=False, completion_fix=False, completion_observe=False):
+    if sum((fps_opt, async_fix, completion_fix, completion_observe)) > 1:
+        raise ValueError('Keep the async creation, FPS, completion-wait and completion-observation experiments separate')
     if async_fix:
         return ASYNC_PATCHES
     if completion_fix:
         return COMPLETION_PATCHES
+    if completion_observe:
+        return COMPLETION_OBSERVE_PATCHES
     # The FPS experiment starts from the four-patch, desktop-capable plugin.
     # Preserve the separate CoreImage experiment instead of mixing its changes in.
     return FPS_PATCHES if fps_opt else ADRENOMETAL_PATCHES
 
 
-def prepare(root, device, fps_opt=False, async_fix=False, completion_fix=False):
+def prepare(root, device, fps_opt=False, async_fix=False, completion_fix=False, completion_observe=False):
     for path, (url, commit) in SUBMODULES.items():
         entry = read(['git', '-C', root, 'ls-tree', 'HEAD', path]).split()
         if entry[:3] != ['160000', 'commit', commit]:
@@ -82,7 +86,7 @@ def prepare(root, device, fps_opt=False, async_fix=False, completion_fix=False):
             raise SystemExit('Submodule path is not empty: ' + path)
         fetch(target, url, commit)
     metal = root / 'drivers/AdrenoMetal'
-    for patch in plugin_patches(fps_opt, async_fix, completion_fix):
+    for patch in plugin_patches(fps_opt, async_fix, completion_fix, completion_observe):
         if patch == ASYNC_PATCH:
             shutil.copyfile(metal / 'NativeBridgeMetalFrontend.mm', metal / 'NabuAsyncCreation.baseline.mm')
         run(['git', '-C', metal, 'apply', '--check', device / patch])
@@ -112,7 +116,7 @@ def bundle_files(bundle):
     return files
 
 
-def build(root, device, output, env, fps_opt=False, async_fix=False, completion_fix=False):
+def build(root, device, output, env, fps_opt=False, async_fix=False, completion_fix=False, completion_observe=False):
     """Returns the report's plugin section; the build's own return code is plugin['plugin_returncode']."""
     root, device, output = Path(root), Path(device).resolve(), Path(output)
     abi = device / 'gpu/upstream/Adreno6xx'
@@ -120,12 +124,22 @@ def build(root, device, output, env, fps_opt=False, async_fix=False, completion_
     report = {'adrenometal_commit': SUBMODULES['drivers/AdrenoMetal'][1],
               'adrenopm4_commit': SUBMODULES['kits/AdrenoPM4'][1], 'rust_toolchain': RUST,
               'abi_header_sha256': sha(abi / 'NativeAdrenoABI.h'), 'gpu_exercised': False, 'runtime_qualified': False}
-    report['metal2vulkan_commit'] = prepare(root, device, fps_opt, async_fix, completion_fix)
+    report['metal2vulkan_commit'] = prepare(root, device, fps_opt, async_fix, completion_fix, completion_observe)
     report['adrenometal_patches'] = {patch: sha(device / patch)
-                                   for patch in plugin_patches(fps_opt, async_fix, completion_fix)}
+                                   for patch in plugin_patches(fps_opt, async_fix, completion_fix, completion_observe)}
     report['fps_opt'] = fps_opt
     report['async_fix'] = async_fix
     report['completion_fix'] = completion_fix
+    report['completion_observe'] = completion_observe
+    if completion_observe:
+        from nabu_metal_completion_observation import qualify
+        source_output = output / 'completion-observe-source'
+        source_output.mkdir()
+        metal = root / 'drivers/AdrenoMetal'
+        report['completion_observation'] = qualify(
+            metal / 'NativeBridgeMetalFrontend.mm', source_output, device / COMPLETION_OBSERVE_PATCH)
+        report['completion_observation_helper_sha256'] = sha(
+            Path(__file__).with_name('nabu_metal_completion_observation.py'))
     if async_fix:
         from nabu_metal_async_qualification import qualify
         source_output = output / 'async-source'

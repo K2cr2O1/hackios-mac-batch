@@ -42,6 +42,10 @@ on:
         description: Turnip-only completion-wait decoupling fix; waits stop tracking user handler delivery
         type: boolean
         default: false
+      completion_observe:
+        description: Turnip-only completion observation on the four-patch baseline; preserves wait and callback behavior
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -77,10 +81,12 @@ jobs:
           FPS_OPT: ${{ inputs.fps_opt }}
           ASYNC_FIX: ${{ inputs.async_fix }}
           COMPLETION_FIX: ${{ inputs.completion_fix }}
+          COMPLETION_OBSERVE: ${{ inputs.completion_observe }}
         run: |
           test "$FPS_OPT" != true
           test "$ASYNC_FIX" != true
           test "$COMPLETION_FIX" != true
+          test "$COMPLETION_OBSERVE" != true
           test "$REQUESTED_REF" = 245aca1a9ec5b730b1cad80fade295800d2981f1
           if [ "$GPU_USERPROBE" = true ]; then test "$REQUESTED_CONFIG" = nabu_ufs_gpu_metal_defconfig; fi
           test -d "$DEVELOPER_DIR"
@@ -227,6 +233,7 @@ jobs:
           FPS_OPT: ${{ inputs.fps_opt }}
           ASYNC_FIX: ${{ inputs.async_fix }}
           COMPLETION_FIX: ${{ inputs.completion_fix }}
+          COMPLETION_OBSERVE: ${{ inputs.completion_observe }}
         run: |
           fps_args=()
           if [ "$FPS_OPT" = true ]; then fps_args+=(--fps-opt); fi
@@ -237,6 +244,10 @@ jobs:
           if [ "$COMPLETION_FIX" = true ]; then
             test "$FPS_OPT" != true && test "$ASYNC_FIX" != true
             fps_args+=(--completion-fix)
+          fi
+          if [ "$COMPLETION_OBSERVE" = true ]; then
+            test "$FPS_OPT" != true && test "$ASYNC_FIX" != true && test "$COMPLETION_FIX" != true
+            fps_args+=(--completion-observe)
           fi
           python3 source-ci/nabu_turnip_ci.py --device nabu-device --plugin \
             --work "$RUNNER_TEMP/unixnu-turnip" --output "$RUNNER_TEMP/turnip-output" "${fps_args[@]}"

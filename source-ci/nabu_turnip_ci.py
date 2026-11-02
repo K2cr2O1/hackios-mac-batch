@@ -99,11 +99,14 @@ def main():
                         help='qualify and build asynchronous Metal creation on the four-patch plugin baseline')
     parser.add_argument('--completion-fix', action='store_true',
                         help='build the command-buffer completion-wait decoupling on the four-patch plugin baseline')
+    parser.add_argument('--completion-observe', action='store_true',
+                        help='observe completion delivery on the four-patch baseline without changing waits')
     args = parser.parse_args()
     require(not args.fps_opt or args.plugin, '--fps-opt requires --plugin')
     require(not args.async_fix or args.plugin, '--async-fix requires --plugin')
     require(not args.completion_fix or args.plugin, '--completion-fix requires --plugin')
-    require(sum((args.fps_opt, args.async_fix, args.completion_fix)) <= 1,
+    require(not args.completion_observe or args.plugin, '--completion-observe requires --plugin')
+    require(sum((args.fps_opt, args.async_fix, args.completion_fix, args.completion_observe)) <= 1,
             'Keep the async creation, FPS and completion-wait experiments separate')
     require(sys.platform == 'darwin' and os.environ.get('GITHUB_ACTIONS') == 'true', 'Run only in macOS GitHub Actions')
     device, root, output = args.device.resolve(), args.work.resolve(), args.output.resolve()
@@ -174,7 +177,8 @@ def main():
             try:
                 plugin = nabu_metal_plugin_ci.build(root, device, output / 'plugin', env,
                                                    fps_opt=args.fps_opt, async_fix=args.async_fix,
-                                                   completion_fix=args.completion_fix)
+                                                   completion_fix=args.completion_fix,
+                                                   completion_observe=args.completion_observe)
             except (subprocess.CalledProcessError, SystemExit, OSError, ValueError, KeyError) as error:
                 plugin = {'plugin_returncode': 1, 'bundle_built': False, 'error': str(error)[-2000:],
                           'gpu_exercised': False, 'runtime_qualified': False}
