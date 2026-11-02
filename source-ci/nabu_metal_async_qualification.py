@@ -143,11 +143,11 @@ int main(int argc,char **argv) {
   __weak id weakOwner=probe->kind==0?(id)library:device;
   [probe.callerLock lock];
   switch(probe->kind){
-   case 0:[library newFunctionWithName:name constantValues:(MTLFunctionConstantValues *)(id)constants completionHandler:^(id<MTLFunction> state,NSError *error){[probe received:state reflection:nil error:error];}];break;
-   case 1:[device newRenderPipelineStateWithDescriptor:descriptor completionHandler:^(id<MTLRenderPipelineState> state,NSError *error){[probe received:state reflection:nil error:error];}];break;
-   case 2:[device newRenderPipelineStateWithDescriptor:descriptor options:MTLPipelineOptionArgumentInfo completionHandler:^(id<MTLRenderPipelineState> state,MTLRenderPipelineReflection *reflection,NSError *error){[probe received:state reflection:reflection error:error];}];break;
-   case 3:[device newComputePipelineStateWithFunction:(id<MTLFunction>)function completionHandler:^(id<MTLComputePipelineState> state,NSError *error){[probe received:state reflection:nil error:error];}];break;
-   case 4:[device newComputePipelineStateWithFunction:(id<MTLFunction>)function options:MTLPipelineOptionArgumentInfo completionHandler:^(id<MTLComputePipelineState> state,MTLComputePipelineReflection *reflection,NSError *error){[probe received:state reflection:reflection error:error];}];break;
+   case 0:{[library newFunctionWithName:name constantValues:(MTLFunctionConstantValues *)(id)constants completionHandler:^(id<MTLFunction> state,NSError *error){[probe received:state reflection:nil error:error];}];break;}
+   case 1:{[device newRenderPipelineStateWithDescriptor:descriptor completionHandler:^(id<MTLRenderPipelineState> state,NSError *error){[probe received:state reflection:nil error:error];}];break;}
+   case 2:{[device newRenderPipelineStateWithDescriptor:descriptor options:MTLPipelineOptionArgumentInfo completionHandler:^(id<MTLRenderPipelineState> state,MTLRenderPipelineReflection *reflection,NSError *error){[probe received:state reflection:reflection error:error];}];break;}
+   case 3:{[device newComputePipelineStateWithFunction:(id<MTLFunction>)function completionHandler:^(id<MTLComputePipelineState> state,NSError *error){[probe received:state reflection:nil error:error];}];break;}
+   case 4:{[device newComputePipelineStateWithFunction:(id<MTLFunction>)function options:MTLPipelineOptionArgumentInfo completionHandler:^(id<MTLComputePipelineState> state,MTLComputePipelineReflection *reflection,NSError *error){[probe received:state reflection:reflection error:error];}];break;}
   }
   require(!probe->inlineCreation.load(),"inline creation can reenter caller lock");
   waitFor(probe.entered);
