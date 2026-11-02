@@ -128,6 +128,7 @@ def main():
     discovery = os.environ.get('NABU_LEGACY_DISCOVERY_ONLY') == '1'
     cpu = os.environ.get('NABU_LEGACY_CPU_PRESENT') == '1'
     scanout = cpu and profile == 'nabu_ufs_gpu_metal_defconfig'
+    producer_watch = cpu and os.environ.get('NABU_UI_WATCH') == '1'
     notification_scope = None
     if discovery and cpu:
         raise SystemExit('Discovery and CPU presentation modes are mutually exclusive')
@@ -156,6 +157,9 @@ def main():
     if cpu:
         shutil.copy2(device / 'platform/NabuDisplayCallTrace.h',
                      source / 'NabuDisplayCallTrace.h')
+    if producer_watch:
+        shutil.copy2(device / 'platform/NabuDisplayProducerWatch.h',
+                     source / 'NabuDisplayProducerWatch.h')
     shutil.copy2(device / 'platform/NabuLegacyStubs.cpp',
                  source / 'NabuLegacyStubs.cpp')
     shutil.copy2(device / 'platform/NabuGraphicsStatus.cpp',
@@ -181,6 +185,8 @@ def main():
                      '-DNABU_KEYBAG_RAM_DATA_VERIFIED=1']
     if scanout:
         includes.append('-DNABU_LEGACY_GPU_SCANOUT=1')
+    if producer_watch:
+        includes.append('-DNABU_DISPLAY_PRODUCER_WATCH=1')
     objects = []
     sources = ['NativeLegacyDisplay.cpp', 'NabuLegacyDisplayProbe.cpp',
                'NabuLegacyStubs.cpp', 'NabuGraphicsStatus.cpp']
@@ -267,6 +273,7 @@ def main():
         'discovery_only': discovery,
         'cpu_present': cpu,
         'gpu_scanout_handoff_compiled': scanout,
+        'producer_thread_watch_compiled': producer_watch,
         'ephemeral_notification_transport_compiled': cpu,
         'notification_profile_qualification': notification_scope,
         'key_state_queries_supported': False,

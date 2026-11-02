@@ -21,6 +21,14 @@
 #include "NabuDisplayCallTrace.h"
 #include <kern/thread.h>
 #endif
+#if defined(NABU_DISPLAY_PRODUCER_WATCH)
+#if !defined(NABU_LEGACY_CPU_PRESENT)
+#error Producer watch requires the explicit CPU presentation and UI-watch build
+#endif
+#include "NabuDisplayProducerWatch.h"
+// The enabled UI-watch source supplies this typed, try-lock-only osfmk sampler.
+extern "C" int nabu_ui_watch_thread_state(thread_t,uint32_t *,uint32_t *,uint64_t *);
+#endif
 
 // nabu CPU-only adaptation: no GOP presenter, GPU hand-off or vsync backend.
 extern "C" void native_gop_presenter_static_init(void) {}
@@ -321,6 +329,25 @@ using ClientStat=ClientRegistry::Slot;
 static ClientRegistry clientRegistry;
 #if defined(NABU_LEGACY_CPU_PRESENT)
 static NabuDisplayCallTrace displayCallTrace;
+#if defined(NABU_DISPLAY_PRODUCER_WATCH)
+static NabuDisplayProducerWatch displayProducerWatch;
+static unsigned displayProducersDump(char *out,unsigned cap) {
+    if(!displayCallTrace.enabled() || !out || cap<256)return 0;
+    const auto snapshot=displayProducerWatch.snapshot();
+    unsigned at=snprintf(out,cap,"R1 callers=%u busy=%llu full=%llu snapshot=independent boot_refs=1\n",
+        snapshot.count,(unsigned long long)snapshot.busy,(unsigned long long)snapshot.full);
+    for(unsigned i=0;i<snapshot.count && at+240<cap;++i) {
+        const auto &caller=snapshot.callers[i];
+        uint32_t state=0,hint=0;uint64_t wait=0;
+        const int sampled=nabu_ui_watch_thread_state(reinterpret_cast<thread_t>(caller.thread),&state,&hint,&wait);
+        at+=snprintf(out+at,cap-at,"R1 caller=%u pid=%d uid=%llu tid=%llu status=%s state=%x hint=%u wait_tag=%llx terminated=%u\n",
+            i,caller.pid,(unsigned long long)caller.uniqueid,(unsigned long long)caller.tid,
+            sampled==0?"sample_ok":sampled==1?"lock_busy":"unavailable",state,hint,
+            (unsigned long long)wait,sampled==0?unsigned((state&0x28)!=0):0);
+    }
+    return at;
+}
+#endif
 static unsigned displayCallsDump(char *out,unsigned cap) {
     if(!displayCallTrace.enabled() || !out || cap<=384)return 0;
     NabuDisplayCallTrace::Snapshot snapshot;
@@ -393,6 +420,14 @@ static IOReturn wrappedExternal(IOUserClient *client,uint32_t selector,IOExterna
     }
 #endif
     IOReturn status=stat?reinterpret_cast<ExternalFn>(stat->identity.original_external)(client,selector,args,dispatch,target,ref):kIOReturnNotAttached;
+#if defined(NABU_DISPLAY_PRODUCER_WATCH)
+    if(displayCallTrace.enabled() && selector==5 && status==kIOReturnSuccess) {
+        NabuDisplayProducerWatch::Caller caller;
+        caller.thread=reinterpret_cast<uintptr_t>(current_thread());caller.tid=thread_tid(current_thread());
+        caller.pid=proc_selfpid();caller.uniqueid=proc_uniqueid(proc_self());
+        displayProducerWatch.record(caller,[](uintptr_t thread) {thread_reference(reinterpret_cast<thread_t>(thread));});
+    }
+#endif
 #if defined(NABU_LEGACY_CPU_PRESENT)
     displayCallTrace.finish(lease,lease.operation>=0?probeNowUs():0,uint32_t(status));
 #endif
@@ -447,6 +482,9 @@ extern "C" unsigned native_legacy_clients_dump(char *out,unsigned cap) {
     unsigned at=0;out[0]=0;
 #if defined(NABU_LEGACY_CPU_PRESENT)
     at=displayCallsDump(out,cap>1536?1536:cap);
+#endif
+#if defined(NABU_DISPLAY_PRODUCER_WATCH)
+    if(at+256<cap)at+=displayProducersDump(out+at,cap-at>1088?1088:cap-at);
 #endif
     const auto registry=clientRegistry.summary();
     if(at+192<cap)at+=snprintf(out+at,cap-at,"O1 clients=%u busy=%llu full=%llu failed=%llu duplicates=%llu\n",registry.count,
