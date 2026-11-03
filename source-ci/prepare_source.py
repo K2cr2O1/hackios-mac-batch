@@ -38,7 +38,7 @@ UFS_OWNER_PROFILES = ('nabu_ufs_root_defconfig', 'nabu_ufs_data_defconfig', CPU_
 UFS_PROFILES = ('nabu_ufs_passive_defconfig', 'nabu_ufs_readonly_defconfig',
                 'nabu_ufs_root_defconfig')
 OWNER_POLICY = {'release': 'nabu-owner-os-21h16-v1', 'asset': 'os-policy.tar.gz',
-                'sha256': '67dde04f5bdc5b2bba1929b046565a460b5f189c5d19a47e6b3ac857039a81e1'}
+                'sha256': 'c5b9e9695e245c7c5a7c91f1ef338ce9c8244c1e842c6ee89cc50031aca64b8b'}
 SYSTEMOS_POLICY = {'release': 'nabu-owner-systemos-21h16-v1', 'asset': 'systemos-policy.tar.gz',
                    'sha256': '04caae89b7b8f5d1b2c5c5ab195f531769083d5fd6266001bf867530d6994a18'}
 ROOT_VOLUME_UUID = 'F577F6BD-3BB9-4864-BBDF-972FC2E94AE3'
