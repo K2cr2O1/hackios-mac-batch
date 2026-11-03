@@ -9,7 +9,7 @@ on:
       defconfig:
         description: Bootstrap, passive/read-only UFS, QEMU transport or owner-verified root (not boot qualification)
         required: true
-        default: "nabu_bootstrap_defconfig"
+        default: "nabu_ufs_root_defconfig"
       xcode:
         description: Xcode on macos-26
         required: true
@@ -112,7 +112,7 @@ jobs:
           test "$(gh api "repos/$PRIVATE_INPUTS_REPO" --jq .private)" = true
           gh release download unixnu-source-inputs --repo "$PRIVATE_INPUTS_REPO" --pattern ipsw-21h16-small.zip --dir "$RUNNER_TEMP"
           actual=$(shasum -a 256 "$RUNNER_TEMP/ipsw-21h16-small.zip" | cut -d' ' -f1)
-          test "$actual" = fce1ea205e571c3850e150404fc04f255f1192ba19c68e12497c19b8f87d8994
+          test "$actual" = bfa03a528848fbfdbea96f0018eb0d68c94c1a9370cad9930006fbabb3bb599f
           echo "SOURCE_INPUT_SHA256=$actual" >> "$GITHUB_ENV"
           echo "UNIXNU_IPSW=$RUNNER_TEMP/ipsw-21h16-small.zip" >> "$GITHUB_ENV"
       - name: Fetch the private 21H16 OS owner policy

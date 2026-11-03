@@ -20,7 +20,7 @@ from nabu_display_ci import (PROFILE as QEMU_LEGACY_PROFILE, CPU_PROFILE as QEMU
 UPSTREAM = '245aca1a9ec5b730b1cad80fade295800d2981f1'
 PATCH = 'patches/xnu/offline-component-load-probes.patch'
 PATCH_SHA256 = '1f228c5c6d8387b13cd8e0964ddeb56c858a5dae16478f3ed2baae8a2e4da1e9'
-INPUT_SHA256 = 'fce1ea205e571c3850e150404fc04f255f1192ba19c68e12497c19b8f87d8994'
+INPUT_SHA256 = 'bfa03a528848fbfdbea96f0018eb0d68c94c1a9370cad9930006fbabb3bb599f'
 CPU_UI_PROFILE = 'nabu_ufs_cpu_ui_defconfig'
 QEMU_DATA_PROFILE = 'nabu_qemu_data_defconfig'
 QEMU_CPU_UI_PROFILE = 'nabu_qemu_cpu_ui_defconfig'
@@ -38,9 +38,9 @@ UFS_OWNER_PROFILES = ('nabu_ufs_root_defconfig', 'nabu_ufs_data_defconfig', CPU_
 UFS_PROFILES = ('nabu_ufs_passive_defconfig', 'nabu_ufs_readonly_defconfig',
                 'nabu_ufs_root_defconfig')
 OWNER_POLICY = {'release': 'nabu-owner-os-21h16-v1', 'asset': 'os-policy.tar.gz',
-                'sha256': '478b9adc9dd57d98a007eb1fa04fd07ff62c1bf2bdec6087fa3997ed11c01452'}
+                'sha256': '67dde04f5bdc5b2bba1929b046565a460b5f189c5d19a47e6b3ac857039a81e1'}
 SYSTEMOS_POLICY = {'release': 'nabu-owner-systemos-21h16-v1', 'asset': 'systemos-policy.tar.gz',
-                   'sha256': 'e56a28b5921f33ee8d5125ac700bd3564e2f1d73208bfa7bd6aa007ec7f130c3'}
+                   'sha256': '04caae89b7b8f5d1b2c5c5ab195f531769083d5fd6266001bf867530d6994a18'}
 ROOT_VOLUME_UUID = 'F577F6BD-3BB9-4864-BBDF-972FC2E94AE3'
 CACHE_VOLUME_UUID = 'C374ACD3-75FE-4FAD-B02E-FC3C9A86DA11'
 # Original j171ap/21H16 security initializer, before the declared prelink slide.
